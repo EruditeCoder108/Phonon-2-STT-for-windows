@@ -217,28 +217,71 @@ class DictationApp:
         self._transcribe_queue.put(pcm_bytes)
 
     def _transcribe_worker(self):
-        """Dedicated background worker that serializes transcription in exact chronological order."""
+        """Dedicated background worker that serializes transcription in exact chronological order.
+
+        Three noise filters are applied before/after the engine call:
+          A) Duration gate  — clips under MIN_AUDIO_SEC are almost always noise/coughs.
+          B) Noise gate     — RMS energy below MIN_RMS_ENERGY means no real speech.
+          C) Hallucination  — Whisper outputs common filler words on non-speech sounds;
+                              suppress results that are entirely a known hallucination.
+        """
+        # ── Tuneable thresholds ─────────────────────────────────────────────
+        MIN_AUDIO_SEC   = 0.35   # (A) ignore clips shorter than this
+        MIN_RMS_ENERGY  = 350    # (B) 16-bit PCM RMS; raise if false positives persist
+        HALLUCINATIONS  = {      # (C) single-word hallucinations to suppress
+            "yeah", "yes", "no", "ok", "okay", "but", "the", "a", "an",
+            "so", "um", "uh", "hmm", "oh", "ah", "hm", "right", "like",
+            "well", "and", "or", "i", "you", "bye", "thank you", "thanks",
+            "thank", "sure", "okay.", "yes.", "no.", "right.", "alright",
+            "all right", "yep", "nope", "mhm", "mm", "mm-hmm",
+        }
+        # ────────────────────────────────────────────────────────────────────
+
+        import numpy as np
+
         while True:
             try:
                 pcm_bytes = self._transcribe_queue.get()
                 if pcm_bytes is None:
                     break
 
+                # ── A: Duration gate ─────────────────────────────────────────
+                duration_sec = len(pcm_bytes) / 32000.0   # 16kHz × 2 bytes
+                if duration_sec < MIN_AUDIO_SEC:
+                    logger.debug(f"🔇 Skipped (too short: {duration_sec:.2f}s)")
+                    self._transcribe_queue.task_done()
+                    continue
+
+                # ── B: Noise / energy gate ────────────────────────────────────
+                audio_arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+                rms = float(np.sqrt(np.mean(audio_arr ** 2))) if len(audio_arr) > 0 else 0.0
+                if rms < MIN_RMS_ENERGY:
+                    logger.debug(f"🔇 Skipped (low energy RMS={rms:.0f})")
+                    self._transcribe_queue.task_done()
+                    continue
+
+                # ── Transcribe ────────────────────────────────────────────────
                 t0 = time.time()
                 raw_text = self.engine.transcribe_wav_bytes(pcm_bytes)
                 elapsed = time.time() - t0
 
                 if raw_text and raw_text.strip():
+                    # ── C: Hallucination blocklist ────────────────────────────
+                    clean = raw_text.strip().lower().rstrip(".,!?")
+                    if clean in HALLUCINATIONS:
+                        logger.debug(f"🔇 Suppressed hallucination: '{raw_text.strip()}'")
+                        self._transcribe_queue.task_done()
+                        continue
+
                     # Apply custom vocabulary replacements
                     text = self.vocab.apply(raw_text.strip())
-                    logger.info(f"✨ Transcribed in {elapsed:.2f}s: '{text}'")
+                    logger.info(f"✨ Transcribed in {elapsed:.2f}s (RMS={rms:.0f}): '{text}'")
 
                     # Inject directly into the active field at cursor
                     inject_text(text + " ", prefer_paste=self.config.get("prefer_paste", True))
 
                     # Log to history
-                    duration = len(pcm_bytes) / 32000.0
-                    self.history.add_entry(text, duration_sec=duration)
+                    self.history.add_entry(text, duration_sec=duration_sec)
 
                 self._transcribe_queue.task_done()
             except Exception as e:

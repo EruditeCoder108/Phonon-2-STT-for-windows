@@ -356,6 +356,9 @@ class ClickOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        # Mouse tracking ON: mouseMoveEvent fires without a button held,
+        # so hand/arrow cursor switches correctly just by hovering.
+        self.setMouseTracking(True)
         self._is_dragging = False
         self._mouse_press_pos = None
         self._drag_start_pos = None
@@ -407,7 +410,11 @@ class ClickOverlay(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        self._update_cursor(event.position().toPoint())
+        if self._is_dragging:
+            # Show closed-hand cursor for the whole drag, regardless of position
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            self._update_cursor(event.position().toPoint())
         if event.buttons() & Qt.MouseButton.LeftButton and self._mouse_press_pos:
             delta = event.globalPosition().toPoint() - self._mouse_press_pos
             if delta.manhattanLength() > 5:
@@ -435,8 +442,20 @@ class ClickOverlay(QWidget):
         self._long_press_triggered = False
         self._press_was_inside = False
         self._mouse_press_pos = None
+        # Restore correct cursor immediately after the drag ends
+        self._update_cursor(event.position().toPoint())
         super().mouseReleaseEvent(event)
 
+    def enterEvent(self, event):
+        """Set hand/arrow correctly the instant the mouse enters the widget."""
+        local = self.mapFromGlobal(self.cursor().pos())
+        self._update_cursor(local)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Reset to default arrow when mouse exits the widget."""
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
 
 
 class CircularOrbHUD(QWidget):
