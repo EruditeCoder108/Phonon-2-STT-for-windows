@@ -75,7 +75,7 @@ The local speech server (`phonon-2.exe` / `fermion`) is started automatically wh
 - Windows 10 or 11 (64-bit)
 - Python 3.14
 - A working microphone
-- ~4–8 GB of RAM (the speech model loads into memory)
+- **RAM**: Recommended 8 GB total system RAM (Phonon-2 itself uses **~1.4 GB** for the speech model weights + **~200 MB** for the UI, total ~1.6 GB).
 
 The `phonon-2` / `fermion` speech engine binary is installed as a Python package (`fermion-research`) and runs as a local HTTP server. The model weights are downloaded on first run.
 
