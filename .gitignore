@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Scratch / test artifacts
+scratch_*.png
+test.wav
+
+# Windows shortcuts
+create_shortcut.ps1
+
+# Config with potentially sensitive data (user creates their own)
+config.json
+
+# Logs
+*.log
