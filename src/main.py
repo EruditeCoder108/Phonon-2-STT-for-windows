@@ -219,25 +219,42 @@ class DictationApp:
     def _transcribe_worker(self):
         """Dedicated background worker that serializes transcription in exact chronological order.
 
-        Three noise filters are applied before/after the engine call:
-          A) Duration gate  — clips under MIN_AUDIO_SEC are almost always noise/coughs.
-          B) Noise gate     — RMS energy below MIN_RMS_ENERGY means no real speech.
-          C) Hallucination  — Whisper outputs common filler words on non-speech sounds;
-                              suppress results that are entirely a known hallucination.
+        Three noise filters protect against false positives:
+          A) Duration gate  — clips under MIN_AUDIO_SEC skipped (almost always noise).
+          B) Energy gate    — clips with RMS below MIN_RMS_ENERGY skipped (near-silence).
+          C) Two-tier word filter:
+               HARD_BLOCK — pure filler/noise sounds (um, uh, hmm…). Always suppressed.
+               SOFT_BLOCK — real words you might genuinely say (yeah, okay, yes…).
+                            Only suppressed when the clip is also low-energy OR very short,
+                            meaning it almost certainly came from noise, not intentional speech.
+                            If you clearly say "yeah", it goes through.
         """
-        # ── Tuneable thresholds ─────────────────────────────────────────────
-        MIN_AUDIO_SEC   = 0.35   # (A) ignore clips shorter than this
-        MIN_RMS_ENERGY  = 350    # (B) 16-bit PCM RMS; raise if false positives persist
-        HALLUCINATIONS  = {      # (C) single-word hallucinations to suppress
-            "yeah", "yes", "no", "ok", "okay", "but", "the", "a", "an",
-            "so", "um", "uh", "hmm", "oh", "ah", "hm", "right", "like",
-            "well", "and", "or", "i", "you", "bye", "thank you", "thanks",
-            "thank", "sure", "okay.", "yes.", "no.", "right.", "alright",
-            "all right", "yep", "nope", "mhm", "mm", "mm-hmm",
-        }
-        # ────────────────────────────────────────────────────────────────────
-
         import numpy as np
+
+        # ── Tuneable thresholds ─────────────────────────────────────────────────
+        MIN_AUDIO_SEC  = 0.35   # (A) clips shorter than this are skipped
+        MIN_RMS_ENERGY = 350    # (B) 16-bit PCM RMS floor; raise if noise still leaks
+
+        # (C-i) Always suppressed — these are never real dictation words
+        HARD_BLOCK = {
+            "um", "uh", "hmm", "hm", "ah", "mm",
+            "mhm", "mm-hmm", "erm", "er",
+        }
+
+        # (C-ii) Suppressed ONLY when clip is also low-energy or very short.
+        # If you actually say these clearly they pass through normally.
+        SOFT_BLOCK = {
+            "yeah", "yep", "yes", "no", "nope",
+            "ok", "okay", "alright", "all right",
+            "right", "sure", "like", "so", "well",
+            "but", "and", "or", "oh", "the", "a", "an",
+            "i", "you", "bye", "thanks", "thank you", "thank",
+        }
+        # A soft-block word is suppressed when energy is below this OR clip is very short.
+        # Think of it as: "did the person actually intend to say this?"
+        SOFT_BLOCK_RMS_THRESHOLD  = 700   # below this = probably noise, not speech
+        SOFT_BLOCK_DUR_THRESHOLD  = 0.55  # below this = probably not an intentional word
+        # ────────────────────────────────────────────────────────────────────────
 
         while True:
             try:
@@ -245,14 +262,14 @@ class DictationApp:
                 if pcm_bytes is None:
                     break
 
-                # ── A: Duration gate ─────────────────────────────────────────
+                # ── A: Duration gate ──────────────────────────────────────────
                 duration_sec = len(pcm_bytes) / 32000.0   # 16kHz × 2 bytes
                 if duration_sec < MIN_AUDIO_SEC:
                     logger.debug(f"🔇 Skipped (too short: {duration_sec:.2f}s)")
                     self._transcribe_queue.task_done()
                     continue
 
-                # ── B: Noise / energy gate ────────────────────────────────────
+                # ── B: Energy gate ────────────────────────────────────────────
                 audio_arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
                 rms = float(np.sqrt(np.mean(audio_arr ** 2))) if len(audio_arr) > 0 else 0.0
                 if rms < MIN_RMS_ENERGY:
@@ -260,18 +277,36 @@ class DictationApp:
                     self._transcribe_queue.task_done()
                     continue
 
-                # ── Transcribe ────────────────────────────────────────────────
+                # ── Transcribe ─────────────────────────────────────────────────
                 t0 = time.time()
                 raw_text = self.engine.transcribe_wav_bytes(pcm_bytes)
                 elapsed = time.time() - t0
 
                 if raw_text and raw_text.strip():
-                    # ── C: Hallucination blocklist ────────────────────────────
+                    # ── C: Two-tier word filter ───────────────────────────────
                     clean = raw_text.strip().lower().rstrip(".,!?")
-                    if clean in HALLUCINATIONS:
-                        logger.debug(f"🔇 Suppressed hallucination: '{raw_text.strip()}'")
+
+                    # Hard block — always noise, never real words
+                    if clean in HARD_BLOCK:
+                        logger.debug(f"🔇 Hard-blocked: '{raw_text.strip()}'")
                         self._transcribe_queue.task_done()
                         continue
+
+                    # Soft block — only suppress if the audio looked like noise too
+                    if clean in SOFT_BLOCK:
+                        looks_like_noise = (
+                            rms < SOFT_BLOCK_RMS_THRESHOLD or
+                            duration_sec < SOFT_BLOCK_DUR_THRESHOLD
+                        )
+                        if looks_like_noise:
+                            logger.debug(
+                                f"🔇 Soft-blocked (noise-level audio RMS={rms:.0f} "
+                                f"dur={duration_sec:.2f}s): '{raw_text.strip()}'"
+                            )
+                            self._transcribe_queue.task_done()
+                            continue
+                        # Energy and duration look intentional — let it through
+                        logger.debug(f"✅ Soft-block passed (RMS={rms:.0f} dur={duration_sec:.2f}s): '{clean}'")
 
                     # Apply custom vocabulary replacements
                     text = self.vocab.apply(raw_text.strip())
@@ -286,6 +321,7 @@ class DictationApp:
                 self._transcribe_queue.task_done()
             except Exception as e:
                 logger.error(f"Error in transcribe worker: {e}", exc_info=True)
+
 
     # ── Dashboard & Orb Settings ──
 
