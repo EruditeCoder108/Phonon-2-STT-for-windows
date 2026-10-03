@@ -184,36 +184,39 @@ body {
     const el = document.getElementById('loader');
 
     // ── Appearance state ──
-    let colorTheme    = "rainbow";
-    let customHue     = 195;
+    let colorTheme      = "rainbow";
+    let customHue       = 195;
     let animationStyle  = "liquid";
     let scaleMultiplier = 0.14;
     let speedMultiplier = 1.0;
+    let baseScale       = 0.70;
+    let orbOpacity      = 1.0;
 
     // Hue cycling (all in 0–360 degrees)
     let currentHue      = 38;
-    let targetHueSpeed  = 14;
-    let currentHueSpeed = 14;
+    let targetHueSpeed  = 10;
+    let currentHueSpeed = 10;
 
-    // Animation playback rate
-    let targetRate  = 0.38;
-    let currentRate = 0.38;
+    // Animation playback rate — calm idle, distinct but gentle listening speedup
+    let targetRate      = 0.20;
+    let currentRate     = 0.20;
 
     // Scale (driven by volume)
-    let targetScale  = 0.70;
-    let currentScale = 0.70;
+    let targetScale     = 0.70;
+    let currentScale    = 0.70;
+
+    let currentVolume   = 0.0;
 
     // Bloom: grayscale & brightness lerp from booting → ready
-    // These are JS-driven every frame so the whole filter stays consistent.
-    let targetGray    = 1.0;   // 1 = fully grey (booting), 0 = full color
-    let currentGray   = 1.0;
-    let targetBright  = 0.6;
-    let currentBright = 0.6;
+    let targetGray      = 1.0;   // 1 = fully grey (booting), 0 = full color
+    let currentGray     = 1.0;
+    let targetBright    = 0.6;
+    let currentBright   = 0.6;
 
-    let isPaused      = false;
-    let isListening   = false;
-    let isEngineReady = false;
-    let lastTime      = performance.now();
+    let isPaused        = false;
+    let isListening     = false;
+    let isEngineReady   = false;
+    let lastTime        = performance.now();
 
     // ── Public API called from Python ──
 
@@ -230,9 +233,14 @@ body {
       }
     };
 
-    window.setAppearanceSettings = function(theme, hue, animStyle, scaleMode, speedMode) {
-      colorTheme  = theme || "rainbow";
-      customHue   = (typeof hue === 'number') ? hue : 195;
+    window.setOpacity = function(val) {
+      orbOpacity = Math.max(0.2, Math.min(1.0, val));
+      el.style.opacity = orbOpacity.toFixed(2);
+    };
+
+    window.setAppearanceSettings = function(theme, hue, animStyle, scaleMode, speedMode, baseSize, opacity) {
+      colorTheme     = theme || "rainbow";
+      customHue      = (typeof hue === 'number') ? hue : 195;
       animationStyle = animStyle || "liquid";
 
       if (animationStyle === 'glow_only') {
@@ -243,31 +251,44 @@ body {
 
       if (scaleMode === 'none')        scaleMultiplier = 0.0;
       else if (scaleMode === 'subtle') scaleMultiplier = 0.08;
-      else if (scaleMode === 'high')   scaleMultiplier = 0.24;
+      else if (scaleMode === 'high')   scaleMultiplier = 0.22;
       else                             scaleMultiplier = 0.14;
 
-      if (speedMode === 'relaxed')    speedMultiplier = 0.75;
-      else if (speedMode === 'fast')  speedMultiplier = 1.35;
-      else                            speedMultiplier = 1.0;
+      if (speedMode === 'relaxed')     speedMultiplier = 0.75;
+      else if (speedMode === 'fast')   speedMultiplier = 1.30;
+      else                             speedMultiplier = 1.0;
+
+      if (typeof baseSize === 'number') {
+        baseScale = Math.max(0.40, Math.min(1.10, baseSize / 100.0));
+      }
+      if (typeof opacity === 'number') {
+        orbOpacity = Math.max(0.20, Math.min(1.0, opacity / 100.0));
+      }
     };
 
     function setVisualState(listening, paused, volume) {
-      isListening = listening;
-      isPaused    = paused;
-      volume      = Math.max(0, Math.min(1, volume));
+      isListening   = listening;
+      isPaused      = paused;
+      volume        = Math.max(0, Math.min(1, volume));
+      currentVolume = volume;
 
       if (isPaused) {
-        targetRate      = 0.18;
-        targetScale     = 0.66;
+        // Nearly frozen — visually communicates "paused/waiting"
+        targetRate      = 0.10;
+        targetScale     = baseScale * 0.94;
         targetHueSpeed  = 0;
       } else if (isListening) {
-        targetRate      = (0.55 + volume * 2.25) * speedMultiplier;
-        targetScale     = 0.70 + volume * scaleMultiplier;
-        targetHueSpeed  = (15  + volume * 40)    * speedMultiplier;
+        // Idle is slow (0.20). When listening/speaking, bump up gently:
+        // 0.22 base + volume * 0.16 = max ~0.38. Noticeably livelier, but never frantic!
+        targetRate      = (0.22 + volume * 0.16) * speedMultiplier;
+        targetScale     = baseScale + volume * scaleMultiplier;
+        // Faster hue rotation while speaking so rainbow visibly flows
+        targetHueSpeed  = (18 + volume * 32) * speedMultiplier;
       } else {
-        targetRate      = 0.38 * speedMultiplier;
-        targetScale     = 0.70;
-        targetHueSpeed  = 12   * speedMultiplier;
+        // Idle — slow gentle drift, relaxed and calm
+        targetRate      = 0.20 * speedMultiplier;
+        targetScale     = baseScale;
+        targetHueSpeed  = 10 * speedMultiplier;
       }
     }
 
@@ -299,11 +320,22 @@ body {
           currentHueSpeed += (targetHueSpeed - currentHueSpeed) * Math.min(1, dt * 6);
           currentHue = (currentHue + currentHueSpeed * dt) % 360;
           hueRot = hueRotateDeg(currentHue);
-        } else if (colorTheme === "cyan_blue") { hueRot = hueRotateDeg(195); }
-        else if (colorTheme === "gold_fire")    { hueRot = 0;                }
-        else if (colorTheme === "emerald")      { hueRot = hueRotateDeg(145);}
-        else if (colorTheme === "violet")       { hueRot = hueRotateDeg(275);}
-        else if (colorTheme === "custom")       { hueRot = hueRotateDeg(customHue); }
+        } else {
+          let baseH = 38;
+          if (colorTheme === "cyan_blue")      baseH = 195;
+          else if (colorTheme === "gold_fire") baseH = 38;
+          else if (colorTheme === "emerald")   baseH = 145;
+          else if (colorTheme === "violet")    baseH = 275;
+          else if (colorTheme === "custom")    baseH = customHue;
+
+          if (isListening) {
+            // When speaking/listening, add an active voice-reactive color shift!
+            const shift = (Math.sin(now * 0.003) * 14) + (currentVolume * 24);
+            hueRot = hueRotateDeg((baseH + shift + 360) % 360);
+          } else {
+            hueRot = hueRotateDeg(baseH);
+          }
+        }
       }
 
       // ── Apply combined filter — one property, all children shift together ──
@@ -311,6 +343,10 @@ body {
         `grayscale(${currentGray.toFixed(3)}) ` +
         `brightness(${currentBright.toFixed(3)}) ` +
         `hue-rotate(${hueRot.toFixed(1)}deg)`;
+
+      // ── Opacity (controlled by user slider, smoothly blends with booting state) ──
+      const effectiveOpacity = orbOpacity * (0.55 + 0.45 * (1.0 - currentGray));
+      el.style.opacity = effectiveOpacity.toFixed(2);
 
       // ── Scale (voice reactivity) ──
       currentScale += (targetScale - currentScale) * Math.min(1, dt * 16);
@@ -348,10 +384,7 @@ class ClickOverlay(QWidget):
     right_clicked = Signal(QPoint)
     long_pressed = Signal()
 
-    # The orb is a 100 px circle, centred inside the 180 px widget, rendered
-    # at CSS scale(0.70).  Visual radius ≈ 50 px.  We add a small margin so
-    # the very edge of the orb remains easily clickable.
-    _ORB_RADIUS = 54   # px in widget-local coords
+    _DEFAULT_ORB_RADIUS = 54   # px in widget-local coords at default 70% scale
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -359,6 +392,7 @@ class ClickOverlay(QWidget):
         # Mouse tracking ON: mouseMoveEvent fires without a button held,
         # so hand/arrow cursor switches correctly just by hovering.
         self.setMouseTracking(True)
+        self._orb_radius = self._DEFAULT_ORB_RADIUS
         self._is_dragging = False
         self._mouse_press_pos = None
         self._drag_start_pos = None
@@ -371,13 +405,19 @@ class ClickOverlay(QWidget):
         self._long_press_timer.timeout.connect(self._on_long_press_timeout)
         self._long_press_triggered = False
 
+    def set_base_scale(self, scale_pct: int):
+        """Dynamically adjusts hit-test radius when orb base size setting changes."""
+        scale = max(0.40, min(1.10, float(scale_pct) / 100.0))
+        self._orb_radius = int(50.0 * scale + 19.0)
+
     def _inside_orb(self, local_pos) -> bool:
         """Return True if *local_pos* (QPoint in widget coords) is within the orb circle."""
         cx = self.width() / 2
         cy = self.height() / 2
         dx = local_pos.x() - cx
         dy = local_pos.y() - cy
-        return (dx * dx + dy * dy) <= (self._ORB_RADIUS * self._ORB_RADIUS)
+        r = getattr(self, "_orb_radius", self._DEFAULT_ORB_RADIUS)
+        return (dx * dx + dy * dy) <= (r * r)
 
     def _update_cursor(self, local_pos):
         if self._inside_orb(local_pos):
@@ -529,8 +569,12 @@ class CircularOrbHUD(QWidget):
         style = cfg.get("animation_style", "liquid")
         scale = cfg.get("scale_reactivity", "normal")
         speed = cfg.get("speed_pace", "balanced")
+        base_size = cfg.get("orb_base_size", 70)
+        opacity = cfg.get("orb_opacity", 100)
 
-        js = f"window.setAppearanceSettings('{theme}', {hue}, '{style}', '{scale}', '{speed}');"
+        self.overlay.set_base_scale(base_size)
+
+        js = f"window.setAppearanceSettings('{theme}', {hue}, '{style}', '{scale}', '{speed}', {base_size}, {opacity});"
         self.web_view.page().runJavaScript(js)
 
     def set_engine_ready(self, ready: bool, message: str = ""):

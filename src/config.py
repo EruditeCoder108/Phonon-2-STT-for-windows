@@ -21,6 +21,8 @@ DEFAULT_CONFIG = {
     "animation_style": "liquid", # "liquid", "glow_only"
     "scale_reactivity": "normal",# "none", "subtle", "normal", "high"
     "speed_pace": "balanced",    # "relaxed", "balanced", "fast"
+    "orb_base_size": 70,         # 45 - 100 (% scale)
+    "orb_opacity": 100,          # 20 - 100 (% opacity)
     "autostart": False,
 }
 

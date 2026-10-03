@@ -96,7 +96,7 @@ class OrbSettingsDialog(QDialog):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(380, 520)
+        self.setFixedSize(400, 680)
 
         self._drag_pos = None
         self._init_ui()
@@ -118,20 +118,37 @@ class OrbSettingsDialog(QDialog):
                 color: #dcdce6;
                 font-family: 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
             }
-            QSlider::groove:horizontal {
+            QSlider#hueSlider::groove:horizontal {
                 height: 6px;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #ff0055, stop:0.17 #ff9900, stop:0.33 #00f076,
                     stop:0.50 #00d2ff, stop:0.67 #0066ff, stop:0.83 #aa00ff, stop:1 #ff0055);
                 border-radius: 3px;
             }
-            QSlider::handle:horizontal {
+            QSlider#hueSlider::handle:horizontal {
                 background: #ffffff;
                 border: 2px solid #00d2ff;
                 width: 16px;
                 margin-top: -5px;
                 margin-bottom: -5px;
                 border-radius: 8px;
+            }
+            QSlider#sizeSlider::groove:horizontal, QSlider#opacitySlider::groove:horizontal {
+                height: 6px;
+                background: rgba(255, 255, 255, 0.10);
+                border-radius: 3px;
+            }
+            QSlider#sizeSlider::sub-page:horizontal, QSlider#opacitySlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0078d4, stop:1 #00d2ff);
+                border-radius: 3px;
+            }
+            QSlider#sizeSlider::handle:horizontal, QSlider#opacitySlider::handle:horizontal {
+                background: #ffffff;
+                border: 2px solid #00d2ff;
+                width: 14px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 7px;
             }
             QCheckBox {
                 color: #dcdce6;
@@ -153,8 +170,8 @@ class OrbSettingsDialog(QDialog):
         """)
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(22, 18, 22, 18)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
 
         # ── 1. Header with Close Button ──
         header = QHBoxLayout()
@@ -206,7 +223,7 @@ class OrbSettingsDialog(QDialog):
         layout.addWidget(c_title)
 
         swatch_row = QHBoxLayout()
-        swatch_row.setSpacing(12)
+        swatch_row.setSpacing(10)
 
         # Create gradient brushes for each swatch
         rainbow_grad = QLinearGradient(0, 0, 40, 40)
@@ -260,6 +277,7 @@ class OrbSettingsDialog(QDialog):
         s_layout.setSpacing(4)
 
         self.hue_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hue_slider.setObjectName("hueSlider")
         self.hue_slider.setRange(0, 360)
         self.hue_slider.setValue(self.config.get("custom_hue", 195))
         self.hue_slider.valueChanged.connect(self._on_hue_slider_changed)
@@ -268,10 +286,12 @@ class OrbSettingsDialog(QDialog):
         layout.addWidget(self.slider_box)
         self.slider_box.setVisible(active_theme == "custom")
 
-        # ── 3. Animation Style (Segmented) ──
+        # ── 3. Animation Style & Speed (Side-by-side or stacked) ──
+        style_header = QHBoxLayout()
         s_title = QLabel("ANIMATION STYLE")
         s_title.setStyleSheet("font-size: 10px; font-weight: bold; color: #707085; letter-spacing: 1px;")
-        layout.addWidget(s_title)
+        style_header.addWidget(s_title)
+        layout.addLayout(style_header)
 
         style_seg = QFrame()
         style_seg.setStyleSheet("background: rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 2px;")
@@ -279,7 +299,7 @@ class OrbSettingsDialog(QDialog):
         style_layout.setContentsMargins(2, 2, 2, 2)
         style_layout.setSpacing(4)
 
-        self.btn_liquid = SegmentedPill("🌊 Dynamic Liquid Molten", "liquid")
+        self.btn_liquid = SegmentedPill("🌊 Dynamic Liquid", "liquid")
         self.btn_glow = SegmentedPill("✨ Calm Solid Glow", "glow_only")
 
         cur_style = self.config.get("animation_style", "liquid")
@@ -293,7 +313,80 @@ class OrbSettingsDialog(QDialog):
         style_layout.addWidget(self.btn_glow)
         layout.addWidget(style_seg)
 
-        # ── 4. Voice Size Reactivity (Segmented) ──
+        # ── 4. Animation Pace / Motion Speed ──
+        pace_title = QLabel("ANIMATION PACE")
+        pace_title.setStyleSheet("font-size: 10px; font-weight: bold; color: #707085; letter-spacing: 1px;")
+        layout.addWidget(pace_title)
+
+        pace_seg = QFrame()
+        pace_seg.setStyleSheet("background: rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 2px;")
+        pace_layout = QHBoxLayout(pace_seg)
+        pace_layout.setContentsMargins(2, 2, 2, 2)
+        pace_layout.setSpacing(4)
+
+        self.pace_btns = [
+            SegmentedPill("🐢 Gentle", "relaxed"),
+            SegmentedPill("⚡ Balanced", "balanced"),
+            SegmentedPill("🔥 Brisk", "fast"),
+        ]
+        cur_pace = self.config.get("speed_pace", "balanced")
+        for pb in self.pace_btns:
+            pb.setChecked(pb.value == cur_pace)
+            pb.clicked.connect(lambda _, b=pb: self._set_pace(b.value))
+            pace_layout.addWidget(pb)
+        layout.addWidget(pace_seg)
+
+        # ── 5. Sliders: Orb Size & Opacity ──
+        sliders_frame = QFrame()
+        sliders_frame.setStyleSheet("""
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            padding: 6px 10px;
+        """)
+        sliders_layout = QVBoxLayout(sliders_frame)
+        sliders_layout.setContentsMargins(6, 4, 6, 4)
+        sliders_layout.setSpacing(8)
+
+        # Size row
+        size_top = QHBoxLayout()
+        size_lbl = QLabel("BASE ORB SIZE")
+        size_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #707085; letter-spacing: 1px;")
+        self.size_val_lbl = QLabel(f"{self.config.get('orb_base_size', 70)}%")
+        self.size_val_lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #00d2ff;")
+        size_top.addWidget(size_lbl)
+        size_top.addStretch()
+        size_top.addWidget(self.size_val_lbl)
+        sliders_layout.addLayout(size_top)
+
+        self.size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.size_slider.setObjectName("sizeSlider")
+        self.size_slider.setRange(45, 100)
+        self.size_slider.setValue(self.config.get("orb_base_size", 70))
+        self.size_slider.valueChanged.connect(self._on_size_slider_changed)
+        sliders_layout.addWidget(self.size_slider)
+
+        # Opacity row
+        op_top = QHBoxLayout()
+        op_lbl = QLabel("ORB OPACITY")
+        op_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #707085; letter-spacing: 1px;")
+        self.opacity_val_lbl = QLabel(f"{self.config.get('orb_opacity', 100)}%")
+        self.opacity_val_lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #00d2ff;")
+        op_top.addWidget(op_lbl)
+        op_top.addStretch()
+        op_top.addWidget(self.opacity_val_lbl)
+        sliders_layout.addLayout(op_top)
+
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setObjectName("opacitySlider")
+        self.opacity_slider.setRange(25, 100)
+        self.opacity_slider.setValue(self.config.get("orb_opacity", 100))
+        self.opacity_slider.valueChanged.connect(self._on_opacity_slider_changed)
+        sliders_layout.addWidget(self.opacity_slider)
+
+        layout.addWidget(sliders_frame)
+
+        # ── 6. Voice Size Reactivity (Segmented) ──
         r_title = QLabel("VOICE SIZE REACTIVITY")
         r_title.setStyleSheet("font-size: 10px; font-weight: bold; color: #707085; letter-spacing: 1px;")
         layout.addWidget(r_title)
@@ -319,13 +412,13 @@ class OrbSettingsDialog(QDialog):
 
         layout.addWidget(react_seg)
 
-        # ── 5. Start with Windows Checkbox Card ──
+        # ── 7. Start with Windows Checkbox Card ──
         card_auto = QFrame()
         card_auto.setStyleSheet("""
             background: rgba(255, 255, 255, 0.04);
             border: 1px solid rgba(255, 255, 255, 0.07);
             border-radius: 10px;
-            padding: 8px 12px;
+            padding: 6px 12px;
         """)
         card_auto_layout = QHBoxLayout(card_auto)
         card_auto_layout.setContentsMargins(6, 4, 6, 4)
@@ -337,7 +430,7 @@ class OrbSettingsDialog(QDialog):
 
         layout.addStretch()
 
-        # ── 6. Bottom Action Bar (Quit App Button + Save Button) ──
+        # ── 8. Bottom Action Bar (Quit App Button + Save Button) ──
         bottom_bar = QHBoxLayout()
         bottom_bar.setSpacing(12)
 
@@ -424,6 +517,19 @@ class OrbSettingsDialog(QDialog):
             b.setChecked(b.value == react_val)
         self._emit_live_update()
 
+    def _set_pace(self, pace_val: str):
+        for b in self.pace_btns:
+            b.setChecked(b.value == pace_val)
+        self._emit_live_update()
+
+    def _on_size_slider_changed(self, val: int):
+        self.size_val_lbl.setText(f"{val}%")
+        self._emit_live_update()
+
+    def _on_opacity_slider_changed(self, val: int):
+        self.opacity_val_lbl.setText(f"{val}%")
+        self._emit_live_update()
+
     def _get_active_theme(self) -> str:
         for sw in self.swatches:
             if sw.isChecked():
@@ -432,6 +538,12 @@ class OrbSettingsDialog(QDialog):
 
     def _get_active_style(self) -> str:
         return "glow_only" if self.btn_glow.isChecked() else "liquid"
+
+    def _get_active_pace(self) -> str:
+        for b in self.pace_btns:
+            if b.isChecked():
+                return b.value
+        return "balanced"
 
     def _get_active_reactivity(self) -> str:
         for b in self.react_btns:
@@ -446,7 +558,9 @@ class OrbSettingsDialog(QDialog):
             "custom_hue": self.hue_slider.value(),
             "animation_style": self._get_active_style(),
             "scale_reactivity": self._get_active_reactivity(),
-            "speed_pace": "balanced",
+            "speed_pace": self._get_active_pace(),
+            "orb_base_size": self.size_slider.value(),
+            "orb_opacity": self.opacity_slider.value(),
             "autostart": self.autostart_cb.isChecked(),
         }
         self.settings_changed.emit(settings)
@@ -457,7 +571,9 @@ class OrbSettingsDialog(QDialog):
             "custom_hue": self.hue_slider.value(),
             "animation_style": self._get_active_style(),
             "scale_reactivity": self._get_active_reactivity(),
-            "speed_pace": "balanced",
+            "speed_pace": self._get_active_pace(),
+            "orb_base_size": self.size_slider.value(),
+            "orb_opacity": self.opacity_slider.value(),
             "autostart": self.autostart_cb.isChecked(),
         }
         self.config.update(new_settings)

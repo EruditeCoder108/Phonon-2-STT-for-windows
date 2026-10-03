@@ -122,20 +122,36 @@ On first launch the speech model will be downloaded (this takes a minute). After
 
 ## Orb Customizer
 
-Long-press the orb (or right-click → Orb Appearance) to change:
+Long-press the orb (or right-click → **🔮 Orb Appearance & Settings...**) to customize:
 
-- **Color Theme** — Rainbow (cycling), Cyan/Ice Blue, Solar Gold, Emerald, Violet, or Custom hue
-- **Animation Style** — Dynamic Liquid (the default morphing blobs) or Calm Solid Glow
-- **Voice Reactivity** — How much the orb scales with your voice volume
+- **Color Theme** — Rainbow Chroma Flow (auto-cycling), Electric Cyan & Ice Blue, Solar Amber & Gold, Emerald Neon Green, Royal Violet, or Custom 360° Hue.
+- **Voice Color Shimmer** — Speaking dynamically shimmers the orb's color with your voice volume in real time (accelerating rainbow flow or shifting theme tones).
+- **Animation Style** — Dynamic Liquid (organic morphing liquid blobs) or Calm Solid Glow.
+- **Animation Pace** — 🐢 Gentle, ⚡ Balanced, or 🔥 Brisk motion speeds. Idle animation stays serene and calm, picking up smoothly when speaking.
+- **Base Orb Size** — Adjustable slider (45% to 100%) with dynamic circular hit-test scaling.
+- **Orb Opacity** — Adjustable slider (25% to 100%) for translucent or solid acrylic desktop presence.
+- **Voice Size Reactivity** — Off, Subtle (~10%), Normal (~20%), or High (~35%).
+- **Windows Autostart** — Start silently with Windows on login.
+
+---
+
+## Smart Noise Filtering (No More False Positives)
+
+To prevent random coughing, breathing, or keyboard clicks from typing unwanted filler words, Phonon-2 includes a built-in 3-layer audio guard:
+
+1. **Duration Gate** — Any audio burst shorter than `0.35s` is silently skipped.
+2. **RMS Energy Gate** — Low-energy sounds below `350 RMS` (breathing, ambient air, distant sounds) are discarded before touching the transcription engine.
+3. **Two-Tier Smart Filter**:
+   - **Hard Block**: Pure noise fillers (`um`, `uh`, `hmm`, `mhm`, `er`) are always discarded.
+   - **Soft Block**: Real words you might intentionally dictate (`yeah`, `okay`, `yes`, `no`, `right`, `sure`) are only filtered if the audio was noise-level; speaking them clearly passes through immediately.
 
 ---
 
 ## Known limitations
 
 - **Windows only.** Uses Win32 APIs (`SendInput`, clipboard), WASAPI audio, PySide6 WebEngine.
-- **Hallucination on noise.** Background sounds (coughs, keyboard clicks) can get transcribed as short filler words ("yeah", "okay"). This is a model-level limitation — plan to add a noise gate and filler-word filter.
-- **Clipboard is temporarily overwritten** during text injection and then restored.
-- **Requires a beefy machine.** The local model is not small. Tested on a machine with a modern Intel/AMD CPU. GPU acceleration is used if available via torch.
+- **Clipboard injection.** Uses Windows clipboard + `Ctrl+V` to inject text into active apps, then automatically restores your original clipboard content. (Direct Unicode `SendInput` is used for terminals).
+- **Requires a capable CPU/GPU.** The local speech model loads into system memory. Tested on modern Intel/AMD processors with fast local inference.
 
 ---
 
