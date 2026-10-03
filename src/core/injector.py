@@ -1,10 +1,11 @@
 """
 Win32 Focus-Safe Text Injector
 
-Provides strategies for typing text into any target application on Windows:
-1. Fast Paste: Clipboard + Ctrl+V via SendInput (most reliable, works everywhere)
-2. Quick Paste: Clipboard + Ctrl+V without save/restore (fast, for streaming)
-3. Direct Unicode SendInput: KEYEVENTF_UNICODE for terminals
+Strategies for putting text into the focused application on Windows:
+1. Unicode SendInput (default): types characters directly. Leaves the clipboard untouched and
+   works in terminals. Handles emoji (surrogate pairs) and newlines.
+2. Clipboard paste (fallback for very long text or when explicitly requested): refuses to run
+   when the clipboard holds non-text data (images/files) that it could not restore.
 """
 
 import ctypes
@@ -27,6 +28,8 @@ KEYEVENTF_UNICODE = 0x0004
 VK_CONTROL = 0x11
 VK_V = 0x56
 VK_BACK = 0x08
+VK_RETURN = 0x0D
+VK_TAB = 0x09
 
 # ── Win32 type annotations (critical for 64-bit pointer safety) ──
 user32.OpenClipboard.restype = wintypes.BOOL
@@ -39,6 +42,8 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 user32.GetClipboardData.argtypes = [wintypes.UINT]
 user32.SetClipboardData.restype = ctypes.c_void_p
 user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
 
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
@@ -48,12 +53,18 @@ kernel32.GlobalUnlock.restype = wintypes.BOOL
 kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalFree.restype = ctypes.c_void_p
 kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.SendInput.restype = wintypes.UINT
 user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
 
@@ -159,68 +170,89 @@ def _simulate_ctrl_v():
 
 # ── Injection strategies ──
 
-def type_via_clipboard(text: str, restore_delay_sec: float = 0.5) -> bool:
+# Clipboard formats that a text-only save/restore would destroy.
+_CF_BITMAP, _CF_DIB, _CF_HDROP = 2, 8, 15
+
+# A single SendInput batch is kept modest: some apps drop events from huge batches.
+_SENDINPUT_BATCH_CHARS = 120
+# Above this length a paste is far faster than typing (and the clipboard is restored).
+AUTO_PASTE_THRESHOLD_CHARS = 600
+
+
+def _clipboard_has_non_text() -> bool:
+    return any(user32.IsClipboardFormatAvailable(f) for f in (_CF_BITMAP, _CF_DIB, _CF_HDROP))
+
+
+def type_via_clipboard(text: str, restore_delay_sec: float = 0.15) -> bool:
     """
-    Inserts text by saving existing clipboard, setting new text, simulating Ctrl+V,
-    and restoring original clipboard after a brief delay.
+    Pastes text via the clipboard, restoring the previous text afterwards.
+    Returns False (without touching anything) if the clipboard holds an image or files,
+    so the caller can fall back to typing instead of destroying the user's clipboard.
     """
     if not text:
         return True
+    if _clipboard_has_non_text():
+        return False
 
     original_text = get_clipboard_text()
-    success = set_clipboard_text(text)
-    if not success:
-        logger.warning("Failed to set clipboard text, falling back to Unicode SendInput.")
-        type_unicode_chars(text)
-        return True
+    if not set_clipboard_text(text):
+        return False
 
     _simulate_ctrl_v()
     time.sleep(restore_delay_sec)
 
-    if original_text is not None:
-        set_clipboard_text(original_text)
-
+    # Only restore if nobody replaced the clipboard in the meantime.
+    if get_clipboard_text() == text:
+        if original_text is not None:
+            set_clipboard_text(original_text)
+        elif user32.OpenClipboard(None):
+            user32.EmptyClipboard()
+            user32.CloseClipboard()
     return True
 
 
-def quick_paste(text: str):
+def _text_to_key_events(text: str) -> list:
+    """Converts text into (vk, scan, flags) events. Non-BMP characters become surrogate pairs."""
+    events = []
+    for ch in text:
+        if ch == "\r":
+            continue
+        if ch == "\n":
+            events.append((VK_RETURN, 0, 0))
+            events.append((VK_RETURN, 0, KEYEVENTF_KEYUP))
+        elif ch == "\t":
+            events.append((VK_TAB, 0, 0))
+            events.append((VK_TAB, 0, KEYEVENTF_KEYUP))
+        else:
+            data = ch.encode("utf-16-le")
+            for i in range(0, len(data), 2):
+                unit = int.from_bytes(data[i:i + 2], "little")
+                events.append((0, unit, KEYEVENTF_UNICODE))
+                events.append((0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    return events
+
+
+def type_unicode_chars(text: str) -> bool:
     """
-    Fast clipboard paste without save/restore. Used during streaming
-    to minimize latency. Caller is responsible for clipboard management.
-    Automatically uses Unicode SendInput if active window is a terminal.
+    Types text with KEYEVENTF_UNICODE events. Returns False if Windows rejected the input
+    (typically because the target window is elevated and we are not — UIPI).
     """
     if not text:
-        return
-    title = get_foreground_window_title().lower()
-    is_terminal = any(term in title for term in ["cmd.exe", "powershell", "terminal", "bash", "wsl"])
-    if is_terminal:
-        type_unicode_chars(text)
-    else:
-        set_clipboard_text(text)
-        time.sleep(0.02)  # Let clipboard settle
-        _simulate_ctrl_v()
-        time.sleep(0.08)  # Let target app process the paste
+        return True
 
-
-def type_unicode_chars(text: str):
-    """
-    Simulates direct keyboard typing using KEYEVENTF_UNICODE.
-    Ideal for command prompts, PowerShell, and terminals.
-    """
-    if not text:
-        return
-
-    n_chars = len(text)
-    inputs = (INPUT * (n_chars * 2))()
-
-    for i, char in enumerate(text):
-        char_code = ord(char)
-        inputs[i * 2].type = INPUT_KEYBOARD
-        inputs[i * 2].u.ki = KEYBDINPUT(0, char_code, KEYEVENTF_UNICODE, 0, 0)
-        inputs[i * 2 + 1].type = INPUT_KEYBOARD
-        inputs[i * 2 + 1].u.ki = KEYBDINPUT(0, char_code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
-
-    user32.SendInput(len(inputs), ctypes.byref(inputs), ctypes.sizeof(INPUT))
+    events = _text_to_key_events(text)
+    step = _SENDINPUT_BATCH_CHARS * 2
+    for i in range(0, len(events), step):
+        batch = events[i:i + step]
+        arr = (INPUT * len(batch))()
+        for j, (vk, scan, flags) in enumerate(batch):
+            arr[j].type = INPUT_KEYBOARD
+            arr[j].u.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+        sent = user32.SendInput(len(batch), ctypes.byref(arr), ctypes.sizeof(INPUT))
+        if sent != len(batch):
+            logger.warning(f"SendInput accepted {sent}/{len(batch)} events (blocked by the target window?).")
+            return False
+    return True
 
 
 def get_foreground_window_title() -> str:
@@ -236,23 +268,66 @@ def get_foreground_window_title() -> str:
     return buff.value
 
 
-def inject_text(text: str, prefer_paste: bool = True):
+def get_foreground_hwnd() -> int:
+    return int(user32.GetForegroundWindow() or 0)
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_ERROR_ACCESS_DENIED = 5
+
+
+def foreground_blocks_injection() -> bool:
     """
-    Main entry point for text injection into the active foreground control.
-    Automatically checks terminal apps or user preference.
+    Heuristic for UIPI: Windows silently discards injected input aimed at an elevated window
+    when we are not elevated. A non-elevated process cannot open the token of an elevated one,
+    so "token query denied" on the foreground window's process is the signal.
+    """
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return False
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return False
+        h_proc = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h_proc:
+            return False
+        try:
+            advapi32 = ctypes.windll.advapi32
+            advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+            h_tok = wintypes.HANDLE()
+            if advapi32.OpenProcessToken(h_proc, _TOKEN_QUERY, ctypes.byref(h_tok)):
+                kernel32.CloseHandle(h_tok)
+                return False
+            return ctypes.GetLastError() == _ERROR_ACCESS_DENIED
+        finally:
+            kernel32.CloseHandle(h_proc)
+    except Exception:
+        return False
+
+
+def inject_text(text: str, mode: str = "auto") -> bool:
+    """
+    Main entry point for text injection into the focused control.
+
+    mode: "auto"  — type; paste only for very long text
+          "type"  — always type
+          "paste" — paste (falls back to typing if the clipboard can't be safely restored)
+    Returns True if the text was handed to the target.
     """
     if not text:
-        return
+        return True
 
-    title = get_foreground_window_title()
-    logger.info(f"Injecting {len(text)} chars into: '{title}'")
+    if foreground_blocks_injection():
+        logger.warning("Foreground window is elevated; Windows blocks injected text into it. "
+                       "Run Phonon-2 as administrator to dictate there.")
+        return False
 
-    is_terminal = any(term in title.lower() for term in ["cmd.exe", "powershell", "terminal", "bash", "wsl"])
-
-    if is_terminal or not prefer_paste:
-        logger.info("Using Unicode SendInput method.")
-        type_unicode_chars(text)
-    else:
-        logger.info("Using clipboard paste method.")
-        type_via_clipboard(text)
-    logger.info("Text injection complete.")
+    want_paste = mode == "paste" or (mode == "auto" and len(text) > AUTO_PASTE_THRESHOLD_CHARS)
+    if want_paste and type_via_clipboard(text):
+        return True
+    return type_unicode_chars(text)

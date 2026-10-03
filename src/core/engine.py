@@ -1,186 +1,128 @@
 """
 Phonon-2 Speech Engine Manager
 
-Manages the local Phonon-2 server daemon (fermion serve) and provides:
-1. One-Shot Audio Transcription (Fast HTTP POST for push-to-talk burst dictation)
-2. Real-Time Streaming Transcription (WebSocket ws://.../v1/audio/stream for live progressive text)
+Owns the local Phonon-2 server process (`phonon-2 serve`) and talks to it over HTTP:
+
+  * Process hygiene — the server's stdout/stderr are DRAINED continuously. The server logs one
+    stderr line per request; an unread pipe fills after ~4 KB (~60 requests) and then blocks the
+    server mid-request, which looks like "transcription just stopped working".
+  * The server is placed in a Windows Job Object with KILL_ON_JOB_CLOSE, so it dies with this
+    process even on a hard crash (no orphaned 1.4 GB processes).
+  * A watchdog polls /health, restarts the server if it dies or wedges, and reports state changes.
+  * transcribe() returns text plus per-word timestamps (verbose_json), which the pipeline uses to
+    stitch phrases together and to sanity-check words.
 """
 
+import ctypes
+import collections
+import io
+import json
+import logging
+import os
 import subprocess
+import sys
 import threading
 import time
-import json
-import queue
-import logging
-import urllib.request
 import urllib.error
-import io
+import urllib.request
 import wave
-import sys
-import os
-from typing import Callable, Optional
+from ctypes import wintypes
+from dataclasses import dataclass, field
+from typing import Callable, Deque, List, Optional
 
 logger = logging.getLogger(__name__)
+server_log = logging.getLogger("PhononServer")
 
 CREATE_NO_WINDOW = 0x08000000
 
 
-class StreamingSession:
-    """Manages a single WebSocket streaming transcription session.
-
-    The session runs a polling loop in a dedicated thread:
-    - Drains queued audio chunks and sends them over the WebSocket
-    - Receives partial/final transcription results from the server
-    - Handles clean shutdown with end-of-stream signaling
-    """
-
-    def __init__(
-        self,
-        ws_url: str,
-        on_partial: Callable[[str], None],
-        on_final: Callable[[str], None],
-        on_done: Callable[[], None],
-        on_error: Callable[[str], None],
-    ):
-        self._ws_url = ws_url
-        self._on_partial = on_partial
-        self._on_final = on_final
-        self._on_done = on_done
-        self._on_error = on_error
-        self._audio_queue: queue.Queue = queue.Queue(maxsize=500)
-        self._active = False
+@dataclass
+class TranscribeResult:
+    text: str = ""
+    words: List[dict] = field(default_factory=list)   # [{"word": str, "start": s, "end": s}]
+    error: bool = False                               # True if the request failed (distinct from "heard nothing")
 
     @property
-    def is_active(self) -> bool:
-        return self._active
+    def timed(self) -> bool:
+        return bool(self.words)
 
-    def start(self):
-        """Opens the WebSocket and begins the streaming session in a background thread."""
-        if self._active:
-            return
-        self._active = True
-        threading.Thread(target=self._run, daemon=True, name="StreamSession").start()
 
-    def send_audio(self, chunk: bytes):
-        """Queue an audio chunk to send. Safe to call from the audio callback thread."""
-        if not self._active:
-            return
-        try:
-            self._audio_queue.put_nowait(chunk)
-        except queue.Full:
-            pass  # Drop frame rather than block the real-time audio thread
+# ── Windows Job Object (child dies with parent) ──
 
-    def stop(self):
-        """Signal the session to finish. Remaining server responses are drained."""
-        if not self._active:
-            return
-        self._active = False
-        try:
-            self._audio_queue.put_nowait(None)  # Sentinel to break send loop
-        except queue.Full:
-            pass
+class _BasicLimit(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
 
-    def _process_message(self, raw: str):
-        """Parse and dispatch a single server JSON message."""
-        data = json.loads(raw)
-        msg_type = data.get("type", "")
-        text = data.get("text", "").strip()
 
-        if msg_type == "partial":
-            self._on_partial(text)
-        elif msg_type == "final":
-            if text:
-                self._on_final(text)
-        elif msg_type == "done":
-            return "done"
-        elif msg_type == "error":
-            self._on_error(data.get("message", "Unknown server error"))
-            return "error"
-        return "ok"
+class _IoCounters(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
 
-    def _run(self):
-        from websockets.sync.client import connect
 
-        ws = None
-        try:
-            ws = connect(self._ws_url, close_timeout=5)
+class _ExtendedLimit(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimit),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
 
-            # Opening handshake: tell server our audio format
-            ws.send(json.dumps({
-                "sample_rate": 16000,
-                "format": "pcm_s16le",
-            }))
-            logger.info("Streaming session opened.")
 
-            # ── Main send+receive polling loop ──
-            sending = True
-            while sending:
-                # Send: drain queued audio
-                while not self._audio_queue.empty():
-                    try:
-                        chunk = self._audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if chunk is None:
-                        sending = False
-                        break
-                    ws.send(chunk)
+_JOB_KILL_ON_CLOSE = 0x2000
+_JOB_EXTENDED_LIMIT_INFO = 9
 
-                # Receive: non-blocking check for server messages
-                try:
-                    raw = ws.recv(timeout=0.03)
-                    result = self._process_message(raw)
-                    if result in ("done", "error"):
-                        sending = False
-                except TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"WebSocket receive error: {e}")
-                    sending = False
 
-            # ── Drain phase: collect remaining finals after audio ends ──
-            logger.info("Audio stream ended, draining remaining results...")
-            drain_deadline = time.time() + 5.0
-            while time.time() < drain_deadline:
-                try:
-                    raw = ws.recv(timeout=0.5)
-                    result = self._process_message(raw)
-                    if result in ("done", "error"):
-                        break
-                except TimeoutError:
-                    break
-                except Exception:
-                    break
-
-        except Exception as e:
-            self._on_error(f"Streaming session error: {e}")
-            logger.error(f"Streaming session error: {e}", exc_info=True)
-        finally:
-            self._active = False
-            if ws:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-            logger.info("Streaming session closed.")
-            try:
-                self._on_done()
-            except Exception:
-                pass
+def _create_kill_on_close_job():
+    """Returns a job handle (kept alive for the process lifetime) or None if unsupported."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtendedLimit()
+        info.BasicLimitInformation.LimitFlags = _JOB_KILL_ON_CLOSE
+        if not k32.SetInformationJobObject(job, _JOB_EXTENDED_LIMIT_INFO, ctypes.byref(info), ctypes.sizeof(info)):
+            return None
+        return job
+    except Exception as e:
+        logger.debug(f"Job object unavailable: {e}")
+        return None
 
 
 class PhononEngine:
-    def __init__(self, port: int = 8010, host: str = "127.0.0.1"):
+    def __init__(self, port: int = 8010, host: str = "127.0.0.1", threads: Optional[int] = None):
         self.port = port
         self.host = host
+        self.threads = threads
         self.base_url = f"http://{self.host}:{self.port}"
-        self.ws_url = f"ws://{self.host}:{self.port}/v1/audio/stream"
         self._process: Optional[subprocess.Popen] = None
+        self._owns_process = False
         self._is_ready = False
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # guards process handle only; never held while waiting
+        self._start_lock = threading.Lock()    # serialises start/restart
+        self._stopping = False
+        self._job = None
+        self._recent_server_output: Deque[str] = collections.deque(maxlen=60)
+        self.on_state_change: Optional[Callable[[bool, str], None]] = None   # (ready, message)
+
+    # ── Health ──
 
     def is_server_running(self) -> bool:
-        """Checks if the local Phonon server is responsive."""
         try:
             req = urllib.request.Request(f"{self.base_url}/health", method="GET")
             with urllib.request.urlopen(req, timeout=1.5) as resp:
@@ -188,8 +130,19 @@ class PhononEngine:
         except Exception:
             return False
 
+    def _set_ready(self, ready: bool, message: str = ""):
+        changed = ready != self._is_ready
+        self._is_ready = ready
+        if changed and self.on_state_change:
+            try:
+                self.on_state_change(ready, message)
+            except Exception:
+                logger.debug("on_state_change callback failed", exc_info=True)
+
+    # ── Process management ──
+
     def _kill_stale_servers(self):
-        """Kill any orphaned phonon-2.exe processes from previous runs."""
+        """Kill orphaned phonon-2.exe processes (e.g. from a previous hard crash)."""
         try:
             result = subprocess.run(
                 ["taskkill", "/f", "/im", "phonon-2.exe"],
@@ -201,120 +154,208 @@ class PhononEngine:
         except Exception:
             pass
 
+    @staticmethod
+    def _drain(stream, tag: str, sink: Deque[str]):
+        """Continuously reads a child pipe so the child can never block on a full buffer."""
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                sink.append(line)
+                # Per-request access lines are noise; anything else may be a real diagnostic.
+                if '"POST ' in line or '"GET ' in line:
+                    server_log.debug(line)
+                else:
+                    server_log.info(f"[{tag}] {line}")
+        except Exception:
+            pass
+
+    def _spawn(self):
+        venv_bin_dir = os.path.dirname(sys.executable)
+        phonon_exe = os.path.join(venv_bin_dir, "phonon-2.exe")
+        if not os.path.exists(phonon_exe):
+            phonon_exe = os.path.join(venv_bin_dir, "fermion.exe")
+
+        cmd = [phonon_exe, "serve", "--port", str(self.port)]
+        if self.threads:
+            cmd += ["--threads", str(int(self.threads))]
+        logger.info(f"Starting Phonon-2 server: {' '.join(cmd)}")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        for stream, tag in ((proc.stdout, "out"), (proc.stderr, "err")):
+            threading.Thread(target=self._drain, args=(stream, tag, self._recent_server_output),
+                             daemon=True, name=f"ServerDrain-{tag}").start()
+
+        if self._job is None:
+            self._job = _create_kill_on_close_job()
+        if self._job:
+            try:
+                k32 = ctypes.windll.kernel32
+                k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+                k32.AssignProcessToJobObject(self._job, int(proc._handle))
+            except Exception as e:
+                logger.debug(f"Could not assign server to job object: {e}")
+        return proc
+
     def start_server(self, wait_timeout: int = 120):
-        """Starts the local Phonon-2 server in the background if not already running."""
-        with self._lock:
-            # Always kill stale servers from previous crashed sessions
+        """Starts (or adopts) the local server and blocks until /health is OK."""
+        with self._start_lock:
+            self._stopping = False
+            if self.is_server_running():
+                logger.info("A healthy Phonon-2 server is already running; adopting it.")
+                self._owns_process = False
+                self._set_ready(True, "adopted")
+                return
+
             self._kill_stale_servers()
+            proc = self._spawn()
+            with self._lock:
+                self._process = proc
+                self._owns_process = True
 
-            # Locate phonon-2.exe or fermion.exe in the venv
-            venv_bin_dir = os.path.dirname(sys.executable)
-            phonon_exe = os.path.join(venv_bin_dir, "phonon-2.exe")
-            if not os.path.exists(phonon_exe):
-                phonon_exe = os.path.join(venv_bin_dir, "fermion.exe")
-
-            cmd = [phonon_exe, "serve", "--port", str(self.port)]
-            logger.info(f"Starting Phonon-2 server: {' '.join(cmd)}")
-
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=CREATE_NO_WINDOW,
-            )
-
-            # Wait for /health to become available (poll every 2s)
             start_time = time.time()
             while time.time() - start_time < wait_timeout:
-                if self._process.poll() is not None:
-                    stderr_out = self._process.stderr.read().decode(errors="replace") if self._process.stderr else ""
-                    raise RuntimeError(f"Phonon-2 server exited with code {self._process.returncode}. Stderr: {stderr_out[:500]}")
+                if self._stopping:
+                    raise RuntimeError("Server start aborted (shutting down).")
+                if proc.poll() is not None:
+                    tail = " | ".join(list(self._recent_server_output)[-5:])
+                    raise RuntimeError(f"Phonon-2 server exited with code {proc.returncode}. Output: {tail[:500]}")
                 if self.is_server_running():
                     logger.info("Phonon-2 server is ready and healthy.")
-                    self._is_ready = True
+                    self._set_ready(True, "ready")
                     return
-                time.sleep(2.0)
+                time.sleep(1.0)
 
             raise TimeoutError(f"Phonon-2 server failed to start within {wait_timeout}s.")
 
     def stop_server(self):
-        """Terminates the local server process if started by this instance."""
+        """Terminates the server process if this instance started it."""
+        self._stopping = True
         with self._lock:
-            if self._process:
-                logger.info("Stopping Phonon-2 server process...")
+            proc, owned = self._process, self._owns_process
+            self._process = None
+        self._is_ready = False
+        if proc and owned:
+            logger.info("Stopping Phonon-2 server process...")
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
                 try:
-                    self._process.terminate()
-                    self._process.wait(timeout=3)
+                    proc.kill()
                 except Exception:
-                    self._process.kill()
-                self._process = None
-            self._is_ready = False
+                    pass
 
-    def create_streaming_session(
-        self,
-        on_partial: Callable[[str], None],
-        on_final: Callable[[str], None],
-        on_done: Callable[[], None],
-        on_error: Callable[[str], None],
-    ) -> StreamingSession:
-        """Creates and starts a new WebSocket streaming transcription session."""
-        session = StreamingSession(
-            ws_url=self.ws_url,
-            on_partial=on_partial,
-            on_final=on_final,
-            on_done=on_done,
-            on_error=on_error,
-        )
-        session.start()
-        return session
+    # ── Watchdog ──
 
-    def transcribe_wav_bytes(self, pcm_bytes: bytes, sample_rate: int = 16000) -> str:
-        """
-        Takes raw 16-bit mono PCM bytes, wraps them into WAV format,
-        and posts to /v1/audio/transcriptions.
-        Returns the recognized text (batch/fallback mode).
-        """
-        if not pcm_bytes:
-            return ""
+    def start_watchdog(self, interval: float = 5.0, failures_before_restart: int = 3):
+        """Background supervisor: restarts the server if it dies or stops answering /health."""
+        def _loop():
+            misses = 0
+            while not self._stopping:
+                time.sleep(interval)
+                if self._stopping or not self._is_ready:
+                    misses = 0
+                    continue
+                if self.is_server_running():
+                    misses = 0
+                    continue
+                misses += 1
+                proc = self._process
+                dead = proc is not None and proc.poll() is not None
+                if dead or misses >= failures_before_restart:
+                    logger.error("Speech server is down or unresponsive; restarting it.")
+                    self._set_ready(False, "restarting")
+                    try:
+                        self.stop_server()
+                        self.start_server(wait_timeout=120)
+                    except Exception as e:
+                        logger.error(f"Server restart failed: {e}")
+                        self._set_ready(False, f"restart failed: {e}")
+                    misses = 0
 
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, "wb") as wf:
+        threading.Thread(target=_loop, daemon=True, name="EngineWatchdog").start()
+
+    # ── Transcription ──
+
+    @staticmethod
+    def _build_multipart(wav_data: bytes, fields: dict, boundary: str) -> bytes:
+        crlf = b"\r\n"
+        body = bytearray()
+        for k, v in fields.items():
+            body += f"--{boundary}".encode() + crlf
+            body += f'Content-Disposition: form-data; name="{k}"'.encode() + crlf + crlf
+            body += str(v).encode() + crlf
+        body += f"--{boundary}".encode() + crlf
+        body += b'Content-Disposition: form-data; name="file"; filename="dictation.wav"' + crlf
+        body += b"Content-Type: audio/wav" + crlf + crlf
+        body += wav_data + crlf
+        body += f"--{boundary}--".encode() + crlf
+        return bytes(body)
+
+    @staticmethod
+    def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(pcm_bytes)
+        return buf.getvalue()
 
-        wav_data = wav_buffer.getvalue()
+    def transcribe(self, pcm_bytes: bytes, sample_rate: int = 16000) -> TranscribeResult:
+        """Transcribes raw 16-bit mono PCM. Retries once on transport errors.
 
-        boundary = "---------------------------PhononBoundary123456"
-        crlf = "\r\n"
-        body = bytearray()
-        body.extend(f"--{boundary}{crlf}".encode())
-        body.extend(f'Content-Disposition: form-data; name="file"; filename="dictation.wav"{crlf}'.encode())
-        body.extend(f"Content-Type: audio/wav{crlf}{crlf}".encode())
-        body.extend(wav_data)
-        body.extend(crlf.encode())
-        body.extend(f"--{boundary}--{crlf}".encode())
+        Returns TranscribeResult(error=True) on failure so callers can tell a failed request
+        apart from a clip with no speech in it.
+        """
+        if not pcm_bytes:
+            return TranscribeResult()
 
-        req = urllib.request.Request(
-            f"{self.base_url}/v1/audio/transcriptions",
-            data=body,
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Content-Length": str(len(body)),
-                "Connection": "close",
-            },
-            method="POST",
+        boundary = "----PhononBoundary7f3a9c21"
+        body = self._build_multipart(
+            self._pcm_to_wav(pcm_bytes, sample_rate),
+            {"response_format": "verbose_json", "timestamp_granularities": "word"},
+            boundary,
         )
 
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp_json = json.loads(resp.read().decode())
-                return resp_json.get("text", "").strip()
-        except urllib.error.HTTPError as e:
-            err_msg = e.read().decode()
-            logger.error(f"HTTP error during transcription ({e.code}): {err_msg}")
-            return ""
-        except Exception as e:
-            logger.error(f"Transcription error: {e}", exc_info=True)
-            return ""
+        last_err = ""
+        for attempt in range(2):
+            req = urllib.request.Request(
+                f"{self.base_url}/v1/audio/transcriptions",
+                data=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(body)),
+                    "Connection": "close",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode())
+                words = [
+                    {"word": w.get("word", ""), "start": float(w.get("start", 0.0)), "end": float(w.get("end", 0.0))}
+                    for w in data.get("words", []) or []
+                ]
+                return TranscribeResult(text=(data.get("text") or "").strip(), words=words)
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"
+                break   # a 4xx/5xx answer is deterministic; retrying will not help
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(0.3)
+
+        logger.error(f"Transcription failed: {last_err}")
+        return TranscribeResult(error=True)
+
+    def transcribe_wav_bytes(self, pcm_bytes: bytes, sample_rate: int = 16000) -> str:
+        """Plain-text convenience wrapper (kept for scripts/tests)."""
+        return self.transcribe(pcm_bytes, sample_rate).text

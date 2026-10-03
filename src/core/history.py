@@ -19,7 +19,8 @@ MAX_HISTORY_ENTRIES = 100
 
 
 class HistoryManager:
-    def __init__(self):
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
         self._lock = threading.Lock()
         self.entries: List[Dict] = self._load()
 
@@ -34,14 +35,16 @@ class HistoryManager:
 
     def _save(self):
         try:
-            with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            tmp_path = HISTORY_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.entries, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, HISTORY_PATH)
         except Exception as e:
             logger.error(f"Error saving dictation history: {e}")
 
     def add_entry(self, text: str, duration_sec: float = 0.0):
         """Appends a new transcription entry to the history log."""
-        if not text or not text.strip():
+        if not self.enabled or not text or not text.strip():
             return
 
         entry = {

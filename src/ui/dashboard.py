@@ -13,25 +13,19 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QCheckBox, QStackedWidget, QListWidget,
     QListWidgetItem, QTableWidget, QTableWidgetItem, QHeaderView,
-    QLineEdit, QProgressBar, QFrame, QScrollArea, QApplication
+    QLineEdit, QProgressBar, QFrame, QScrollArea, QApplication, QSlider
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize
 from PySide6.QtGui import QFont, QColor, QIcon, QKeySequence, QKeyEvent
-import winreg
-import sys
-import os
 import logging
 from typing import Dict
 
+from src.config import get_autostart_registry, set_autostart_registry
 from src.core.audio import AudioCaptureEngine
 from src.core.history import HistoryManager
 from src.core.vocabulary import VocabularyEngine
 
 logger = logging.getLogger(__name__)
-
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-APP_NAME = "Phonon2Dictation"
-
 
 def _make_label(text: str, role: str = "") -> QLabel:
     lbl = QLabel(text)
@@ -39,30 +33,6 @@ def _make_label(text: str, role: str = "") -> QLabel:
         lbl.setProperty("class", role)
         lbl.setObjectName(role)
     return lbl
-
-
-def is_launch_on_startup() -> bool:
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
-            winreg.QueryValueEx(key, APP_NAME)
-            return True
-    except Exception:
-        return False
-
-
-def set_launch_on_startup(enable: bool):
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            if enable:
-                cmd = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
-            else:
-                try:
-                    winreg.DeleteValue(key, APP_NAME)
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.error(f"Error modifying startup registry: {e}")
 
 
 # ── Interactive Keypress Capture Widget ──
@@ -398,19 +368,79 @@ class DashboardWindow(QMainWindow):
         opt_layout = QVBoxLayout(opt_card)
         opt_layout.setSpacing(10)
 
-        self.chime_check = QCheckBox("Play pleasant audio cues when dictation starts and stops")
+        self.chime_check = QCheckBox("Play sound cues (ready, start, stop)")
         self.chime_check.setChecked(self.config.get("sound_effects", True))
         self.chime_check.toggled.connect(self._save_audio_settings)
         opt_layout.addWidget(self.chime_check)
 
+        opt_layout.addWidget(_make_label("Sound style:", "section"))
+        self.sound_theme_combo = QComboBox()
+        for label, key in (("Glass - soft and clear", "glass"), ("Wood - warm and rounded", "wood"),
+                           ("Air - smooth and minimal", "air")):
+            self.sound_theme_combo.addItem(label, key)
+        idx = self.sound_theme_combo.findData(self.config.get("sound_theme", "glass"))
+        self.sound_theme_combo.setCurrentIndex(max(0, idx))
+        self.sound_theme_combo.currentIndexChanged.connect(self._save_audio_settings)
+        opt_layout.addWidget(self.sound_theme_combo)
+
+        vol_row = QHBoxLayout()
+        vol_row.addWidget(_make_label("Cue volume:", "section"))
+        self.sound_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sound_volume_slider.setRange(0, 100)
+        self.sound_volume_slider.setValue(int(self.config.get("sound_volume", 60)))
+        self.sound_volume_label = QLabel(f"{self.sound_volume_slider.value()}%")
+        self.sound_volume_slider.valueChanged.connect(lambda v: self.sound_volume_label.setText(f"{v}%"))
+        self.sound_volume_slider.sliderReleased.connect(self._save_audio_settings)   # preview plays on release
+        vol_row.addWidget(self.sound_volume_slider, 1)
+        vol_row.addWidget(self.sound_volume_label)
+        opt_layout.addLayout(vol_row)
+
         self.startup_check = QCheckBox("Start Phonon-2 automatically on Windows startup (minimized)")
-        self.startup_check.setChecked(is_launch_on_startup())
-        self.startup_check.toggled.connect(lambda val: set_launch_on_startup(val))
+        self.startup_check.setChecked(get_autostart_registry())
+        self.startup_check.toggled.connect(self._on_startup_toggled)
         opt_layout.addWidget(self.startup_check)
+
+        self.history_check = QCheckBox("Save dictated text to history on this PC (turn off if you dictate sensitive text)")
+        self.history_check.setChecked(self.config.get("save_history", True))
+        self.history_check.toggled.connect(self._save_audio_settings)
+        opt_layout.addWidget(self.history_check)
+
+        self.stitch_check = QCheckBox("Smart sentence joining (fixes stray periods and capitals when you pause mid-sentence)")
+        self.stitch_check.setChecked(self.config.get("context_stitch", True))
+        self.stitch_check.toggled.connect(self._save_audio_settings)
+        opt_layout.addWidget(self.stitch_check)
+
+        self.gate_check = QCheckBox("Ignore quiet background voices (video, TV, people nearby) - speak at your normal volume")
+        self.gate_check.setChecked(self.config.get("voice_gate", True))
+        self.gate_check.toggled.connect(self._save_audio_settings)
+        opt_layout.addWidget(self.gate_check)
+
+        self.filler_check = QCheckBox("Remove \"uh\" / \"um\" from the typed text")
+        self.filler_check.setChecked(self.config.get("remove_fillers", True))
+        self.filler_check.toggled.connect(self._save_audio_settings)
+        opt_layout.addWidget(self.filler_check)
+
+        opt_layout.addWidget(_make_label("Pause length that ends a phrase:", "section"))
+        self.pause_combo = QComboBox()
+        for label, ms in (("Quick - 500 ms (snappy, may split long sentences)", 500),
+                          ("Balanced - 700 ms (recommended)", 700),
+                          ("Relaxed - 1000 ms (for slow, thoughtful speech)", 1000),
+                          ("Patient - 1400 ms", 1400)):
+            self.pause_combo.addItem(label, ms)
+        cur_ms = self.config.get("pause_ms", 700)
+        self.pause_combo.setCurrentIndex(min(range(self.pause_combo.count()),
+                                             key=lambda i: abs(self.pause_combo.itemData(i) - cur_ms)))
+        self.pause_combo.currentIndexChanged.connect(self._save_audio_settings)
+        opt_layout.addWidget(self.pause_combo)
 
         layout.addWidget(opt_card)
         layout.addStretch()
         return container
+
+    def _on_startup_toggled(self, enabled: bool):
+        set_autostart_registry(enabled)
+        self.config["autostart"] = enabled
+        self.settings_saved.emit(self.config)
 
     def _toggle_mic_test(self):
         if self.test_audio_engine is None:
@@ -445,6 +475,13 @@ class DashboardWindow(QMainWindow):
         mic_data = self.mic_combo.currentData()
         self.config["mic_index"] = None if mic_data == -1 else mic_data
         self.config["sound_effects"] = self.chime_check.isChecked()
+        self.config["sound_theme"] = self.sound_theme_combo.currentData()
+        self.config["sound_volume"] = self.sound_volume_slider.value()
+        self.config["save_history"] = self.history_check.isChecked()
+        self.config["context_stitch"] = self.stitch_check.isChecked()
+        self.config["voice_gate"] = self.gate_check.isChecked()
+        self.config["remove_fillers"] = self.filler_check.isChecked()
+        self.config["pause_ms"] = self.pause_combo.currentData()
         self.settings_saved.emit(self.config)
 
     # ── Tab 2: Hotkeys & Trigger Mode ──

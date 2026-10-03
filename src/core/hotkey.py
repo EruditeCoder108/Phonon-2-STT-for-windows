@@ -68,6 +68,7 @@ class GlobalHotkeyManager:
         push_to_talk: bool = False,
         on_start: Optional[Callable[[], None]] = None,
         on_stop: Optional[Callable[[], None]] = None,
+        is_active: Optional[Callable[[], bool]] = None,
     ):
         self._trigger_key_name = trigger_key.lower()
         self._is_combo = VK_MAP.get(self._trigger_key_name) == "combo_ctrl_space"
@@ -75,6 +76,9 @@ class GlobalHotkeyManager:
         self.push_to_talk = push_to_talk
         self.on_start = on_start
         self.on_stop = on_stop
+        # The app owns the real dictation state (the orb, tray or an error can change it behind
+        # our back); asking it avoids a stale local flag making the first keypress a no-op.
+        self.is_active = is_active
 
         self._hook = None
         self._hook_proc = None
@@ -87,6 +91,7 @@ class GlobalHotkeyManager:
         self._ctrl_held = False
         self._space_down = False
         self._single_key_down = False
+        self._ptt_held = False
         self._last_toggle_time = 0.0
 
     def set_trigger_key(self, key_name: str):
@@ -98,6 +103,7 @@ class GlobalHotkeyManager:
     def set_mode(self, push_to_talk: bool):
         self.push_to_talk = push_to_talk
         self._is_recording = False
+        self._ptt_held = False
 
     def start(self):
         """Starts the global hook in a dedicated Windows message pump thread."""
@@ -118,7 +124,8 @@ class GlobalHotkeyManager:
 
     def _fire_toggle(self):
         """Toggle recording state and fire the appropriate callback."""
-        self._is_recording = not self._is_recording
+        current = self.is_active() if self.is_active else self._is_recording
+        self._is_recording = not current
         state_str = "ON" if self._is_recording else "OFF"
         logger.info(f"Hotkey toggle triggered -> Recording is {state_str}")
         callback = self.on_start if self._is_recording else self.on_stop
@@ -156,11 +163,13 @@ class GlobalHotkeyManager:
                 # ── Single-key mode (push-to-talk or toggle) ──
                 if vk == self.trigger_vk:
                     if self.push_to_talk:
-                        if is_down and not self._is_recording:
+                        if is_down and not self._ptt_held:
+                            self._ptt_held = True
                             self._is_recording = True
                             if self.on_start:
                                 threading.Thread(target=self.on_start, daemon=True).start()
-                        elif is_up and self._is_recording:
+                        elif is_up and self._ptt_held:
+                            self._ptt_held = False
                             self._is_recording = False
                             if self.on_stop:
                                 threading.Thread(target=self.on_stop, daemon=True).start()

@@ -26,12 +26,19 @@ class VocabularyEngine:
     def _rebuild_patterns(self):
         """Compiles case-insensitive word boundary regexes for fast replacement."""
         self._compiled_patterns = []
-        for trigger, replacement in self.replacements.items():
-            if not trigger.strip():
+        # Longest trigger first so "my email address" wins over "my email".
+        for trigger, replacement in sorted(self.replacements.items(), key=lambda kv: -len(kv[0].strip())):
+            trigger = trigger.strip()
+            if not trigger:
                 continue
-            # Match whole phrase or word, case-insensitively
-            pattern = re.compile(r'\b' + re.escape(trigger.strip()) + r'\b', re.IGNORECASE)
-            self._compiled_patterns.append((pattern, replacement))
+            # \b only works next to a word character; triggers like "c++" need look-arounds.
+            left = r'\b' if re.match(r'\w', trigger[0]) else r'(?<!\w)'
+            right = r'\b' if re.match(r'\w', trigger[-1]) else r'(?!\w)'
+            pattern = re.compile(left + re.escape(trigger) + right, re.IGNORECASE)
+            # A function replacement is inserted literally. A plain string has its backslashes
+            # parsed as regex escapes (a replacement like C:\Users raised an error and the
+            # whole dictated phrase was lost).
+            self._compiled_patterns.append((pattern, lambda m, r=replacement: r))
 
     def apply(self, text: str) -> str:
         """Applies all vocabulary replacement rules to the input text."""

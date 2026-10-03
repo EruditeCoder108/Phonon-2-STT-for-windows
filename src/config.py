@@ -13,7 +13,15 @@ CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".phonon2_config.json")
 DEFAULT_CONFIG = {
     "trigger_key": "ctrl+space",
     "push_to_talk": False,
-    "prefer_paste": True,
+    "injection_mode": "auto",    # "auto" (type; paste only very long text), "type", "paste"
+    "sound_theme": "glass",      # "glass", "wood", "air"
+    "sound_volume": 60,          # 0 - 100
+    "pause_ms": 700,             # silence that ends an utterance (400 - 1500)
+    "context_stitch": True,      # decode with the previous phrase as audio context (fixes "Period. Capital." at pauses)
+    "voice_gate": True,          # treat speech much quieter than yours (video, people nearby) as background
+    "remove_fillers": True,      # drop "uh"/"um" the model writes inside sentences
+    "save_history": True,        # persist dictated text to ~/.phonon2_history.json
+    "engine_threads": None,      # speech-server CPU threads (None = server default)
     "mic_index": None,
     "port": 8010,
     "color_theme": "rainbow",    # "rainbow", "cyan_blue", "gold_fire", "emerald", "violet", "custom"
@@ -39,9 +47,12 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
+    """Writes atomically so a crash mid-save can never leave a truncated config."""
+    tmp_path = CONFIG_PATH + ".tmp"
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        os.replace(tmp_path, CONFIG_PATH)
     except Exception as e:
         logger.error(f"Error saving config: {e}")
 

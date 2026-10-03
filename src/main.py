@@ -2,12 +2,11 @@
 Phonon-2 Windows Native Dictation Application
 
 Orchestrates:
-1. Local Phonon-2 speech engine server (AVX-512 VNNI accelerated)
+1. Local Phonon-2 speech engine server (supervised: auto-restart if it dies)
 2. Global Ctrl+Space toggle keyboard hook (with debouncing & repeat suppression)
-3. Hot-mic WASAPI capture with:
-   - Dynamic Adaptive Noise Floor (room ambient noise filtering)
-   - Continuous Micro-Cadence Segmentation (words stream every 1.2-1.8s)
-4. Dedicated FIFO transcription worker ensuring 100% chronological, non-dropped text
+3. Hot-mic WASAPI capture + VAD segmentation into speech-only utterances
+4. Dedicated FIFO transcription worker running the DictationPipeline
+   (evidence-based filtering, phrase stitching, deferred punctuation, injection)
 5. Interactive Floating Circular Animated Orb HUD (click to dictate, draggable, reactive ripples)
 6. Fluent Dashboard Control Center & System Tray integration
 """
@@ -19,7 +18,7 @@ import queue
 import threading
 import logging
 from PySide6.QtWidgets import QApplication, QMenu
-from PySide6.QtCore import QObject, Signal, Slot, QPoint
+from PySide6.QtCore import QObject, Qt, Signal, Slot, QPoint
 from PySide6.QtGui import QIcon, QAction
 import ctypes
 
@@ -29,14 +28,25 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s",
     datefmt="%H:%M:%S",
 )
+# Persistent log (no dictated text unless history is on) so odd behaviour can be diagnosed afterwards.
+try:
+    from logging.handlers import RotatingFileHandler
+    _fh = RotatingFileHandler(os.path.join(os.path.expanduser("~"), ".phonon2.log"),
+                              maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s", "%H:%M:%S"))
+    logging.getLogger().addHandler(_fh)
+except Exception:
+    pass
 logger = logging.getLogger("PhononApp")
 
 # Internal modules
 from src.config import load_config, save_config
-from src.core.injector import inject_text, type_unicode_chars
+from src.core.injector import inject_text, get_foreground_hwnd
 from src.core.audio import AudioCaptureEngine
+from src.core.segmenter import Utterance
 from src.core.hotkey import GlobalHotkeyManager
 from src.core.engine import PhononEngine
+from src.core.pipeline import DictationPipeline
 from src.core.sound_effects import SoundEffects
 from src.core.vocabulary import VocabularyEngine
 from src.core.history import HistoryManager
@@ -45,13 +55,17 @@ from src.ui.tray import SystemTray
 from src.ui.dashboard import DashboardWindow
 from src.ui.orb_settings_dialog import OrbSettingsDialog
 
+_FLUSH = object()   # queue marker: finish the current sentence (type any deferred punctuation)
+
 
 class AppBridge(QObject):
-    """Thread-safe bridge between Win32 background threads and Qt UI."""
+    """Thread-safe bridge between background threads and Qt UI."""
     sig_started = Signal()
     sig_volume = Signal(float)
     sig_stopped = Signal()
-    sig_engine_ready = Signal()
+    sig_engine_state = Signal(bool, str)      # (ready, message)
+    sig_status = Signal(str, bool)            # tray status text, active
+    sig_notice = Signal(str, str)             # tray balloon: title, message
 
 
 class DictationApp:
@@ -61,10 +75,13 @@ class DictationApp:
         self.bridge = AppBridge()
 
         # Data & Core Features
-        self.history = HistoryManager()
+        self.history = HistoryManager(enabled=self.config.get("save_history", True))
         self.vocab = VocabularyEngine(self.config.get("vocabulary", {}))
         self._is_dictating = False
+        self._is_paused = False
         self._session_start_time = 0.0
+        self._last_notice_time = 0.0
+        self._applied_mic = self.config.get("mic_index")
 
         # Dedicated FIFO Transcription Queue & Worker Thread
         self._transcribe_queue: queue.Queue = queue.Queue()
@@ -73,7 +90,6 @@ class DictationApp:
             daemon=True,
             name="SequentialTranscribeWorker"
         )
-        self._worker_thread.start()
 
         # Set high-resolution light-blue orb application icon
         icon_path = os.path.join(os.path.dirname(__file__), "..", "assets", "icon.png")
@@ -96,22 +112,47 @@ class DictationApp:
         self.bridge.sig_started.connect(lambda: self.hud.set_state("listening"))
         self.bridge.sig_volume.connect(self.hud.set_volume)
         self.bridge.sig_stopped.connect(lambda: self.hud.set_state("idle"))
-        self.bridge.sig_engine_ready.connect(self._on_engine_ready)
+        self.bridge.sig_engine_state.connect(self._on_engine_state)
+        self.bridge.sig_status.connect(self.tray.set_status)
+        self.bridge.sig_notice.connect(self._show_notice)
 
         # Core Engines
-        self.engine = PhononEngine(port=self.config.get("port", 8010))
-        self.sounds = SoundEffects(enabled=self.config.get("sound_effects", True))
+        self.engine = PhononEngine(
+            port=self.config.get("port", 8010),
+            threads=self.config.get("engine_threads"),
+        )
+        self.engine.on_state_change = lambda ready, msg: self.bridge.sig_engine_state.emit(ready, msg)
+        self.sounds = SoundEffects(
+            enabled=self.config.get("sound_effects", True),
+            theme=self.config.get("sound_theme", "glass"),
+            volume=self.config.get("sound_volume", 60),
+        )
+        self._applied_sound = (self.config.get("sound_theme", "glass"), self.config.get("sound_volume", 60))
+        self.pipeline = DictationPipeline(
+            engine=self.engine,
+            vocab=self.vocab,
+            inject=lambda text: inject_text(text, self.config.get("injection_mode", "auto")),
+            history=self.history,
+            get_config=lambda key, default=None: self.config.get(key, default),
+            get_hwnd=get_foreground_hwnd,
+            on_event=self._on_pipeline_event,
+        )
         self.audio = AudioCaptureEngine(
             device_index=self.config.get("mic_index"),
-            on_utterance=self._on_audio_chunk_ready,
+            on_utterance=self._on_utterance_ready,
             on_level_update=lambda lvl: self.bridge.sig_volume.emit(lvl),
+            on_activity=self.pipeline.set_speech_active,
+            pause_ms=self.config.get("pause_ms", 700),
+            voice_gate=self.config.get("voice_gate", True),
         )
         self.hotkey = GlobalHotkeyManager(
             trigger_key=self.config.get("trigger_key", "ctrl+space"),
             push_to_talk=self.config.get("push_to_talk", False),
             on_start=self._start_dictation,
             on_stop=self._stop_dictation,
+            is_active=lambda: self._is_dictating,
         )
+        self._worker_thread.start()
 
         # Connect Tray actions
         self.tray.orb_settings_requested.connect(self._open_orb_settings)
@@ -131,23 +172,43 @@ class DictationApp:
         """Starts the Phonon-2 server in background and engages hotkey hook."""
         def _boot():
             try:
-                self.tray.set_status("Loading Phonon-2...", is_active=False)
+                self.bridge.sig_status.emit("Loading Phonon-2...", False)
                 self.engine.start_server(wait_timeout=120)
-                self.bridge.sig_engine_ready.emit()
+                self.engine.start_watchdog()
             except Exception as e:
                 logger.error(f"Failed to initialize engine: {e}")
-                self.tray.set_status("Engine Error", is_active=False)
+                self.bridge.sig_status.emit("Engine Error", False)
 
         threading.Thread(target=_boot, daemon=True, name="EngineBootThread").start()
         self.audio.warm_up()
         self.hotkey.start()
 
-    @Slot()
-    def _on_engine_ready(self):
-        self.tray.set_status("Phonon-2 Ready", is_active=True)
-        key_name = self.config.get("trigger_key", "Ctrl+Space").upper()
-        # Blooms orb from grey to color — no sound, the visual bloom is the feedback
-        self.hud.set_engine_ready(True, f"Ready • [{key_name}]")
+    @Slot(bool, str)
+    def _on_engine_state(self, ready: bool, message: str):
+        if ready:
+            self.tray.set_status("Phonon-2 Ready", is_active=True)
+            key_name = self.config.get("trigger_key", "Ctrl+Space").upper()
+            # Blooms the orb from grey to colour, with a matching "ready" chime
+            self.hud.set_engine_ready(True, f"Ready • [{key_name}]")
+            self.sounds.play_ready()
+        else:
+            self.tray.set_status("Speech engine restarting...", is_active=False)
+            self.hud.set_engine_ready(False)
+            if self._is_dictating:
+                self._stop_dictation()
+
+    @Slot(str, str)
+    def _show_notice(self, title: str, message: str):
+        # Throttled so a persistent problem doesn't spam balloons.
+        now = time.time()
+        if now - self._last_notice_time > 30:
+            self._last_notice_time = now
+            self.tray.show_message(title, message)
+
+    def _on_pipeline_event(self, kind: str, message: str):
+        """Called from the worker thread; marshals to the UI via signals."""
+        title = "Phonon-2: can't type here" if kind == "blocked" else "Phonon-2 error"
+        self.bridge.sig_notice.emit(title, message)
 
     # ── Interactive Dictation Control (Hotkey or Orb Click) ──
 
@@ -162,11 +223,12 @@ class DictationApp:
         """Called when user right-clicks the floating orb: Pause/Resume."""
         if not self._is_dictating:
             return
-        self._is_paused = not getattr(self, "_is_paused", False)
+        self._is_paused = not self._is_paused
         if self._is_paused:
             logger.info("⏸️ Dictation paused.")
             self.hud.set_state("paused")
             self.sounds.play_stop()
+            self._transcribe_queue.put(_FLUSH)   # finish the sentence typed so far
         else:
             logger.info("▶️ Dictation resumed.")
             self.hud.set_state("listening")
@@ -184,6 +246,7 @@ class DictationApp:
         self._is_dictating = True
         self._is_paused = False
         self._session_start_time = time.time()
+        self.pipeline.reset()
         logger.info("🎙️ Dictation started.")
 
         self.sounds.play_start()
@@ -191,7 +254,7 @@ class DictationApp:
         self.audio.start()
 
     def _stop_dictation(self):
-        """Stops dictation session and finalizes any remaining tail audio."""
+        """Stops dictation session; speech still in flight is finalized and typed."""
         if not self._is_dictating:
             return
 
@@ -202,126 +265,45 @@ class DictationApp:
         self.sounds.play_stop()
         self.bridge.sig_stopped.emit()
 
-        # Stop audio capture and queue any remaining tail PCM bytes
-        tail_bytes = self.audio.stop()
-        if tail_bytes and len(tail_bytes) >= 1600:  # > 0.1s
-            self._transcribe_queue.put(tail_bytes)
+        # audio.stop() pushes any in-flight utterance onto the queue; the FLUSH marker that
+        # follows makes the worker type the last sentence's closing punctuation.
+        self.audio.stop()
+        self._transcribe_queue.put(_FLUSH)
 
-    # ── Continuous Chunk Handling & Sequential Worker ──
+    # ── Utterance Handling & Sequential Worker ──
 
-    def _on_audio_chunk_ready(self, pcm_bytes: bytes):
-        """Called as you speak when a natural micro-pause or cadence is reached."""
-        if not self._is_dictating or getattr(self, "_is_paused", False):
+    def _on_utterance_ready(self, utt: Utterance):
+        """Called from the audio thread when a spoken phrase has ended."""
+        if not self._is_dictating or self._is_paused:
             return
-        # Queue chunk for strict sequential FIFO transcription
-        self._transcribe_queue.put(pcm_bytes)
+        self._transcribe_queue.put(utt)
 
     def _transcribe_worker(self):
-        """Dedicated background worker that serializes transcription in exact chronological order.
+        """Single worker that processes utterances strictly in order.
 
-        Three noise filters protect against false positives:
-          A) Duration gate  — clips under MIN_AUDIO_SEC skipped (almost always noise).
-          B) Energy gate    — clips with RMS below MIN_RMS_ENERGY skipped (near-silence).
-          C) Two-tier word filter:
-               HARD_BLOCK — pure filler/noise sounds (um, uh, hmm…). Always suppressed.
-               SOFT_BLOCK — real words you might genuinely say (yeah, okay, yes…).
-                            Only suppressed when the clip is also low-energy OR very short,
-                            meaning it almost certainly came from noise, not intentional speech.
-                            If you clearly say "yeah", it goes through.
+        All the intelligence lives in DictationPipeline (filtering on VAD/SNR evidence,
+        phrase stitching, deferred punctuation, injection). The short get() timeout lets the
+        pipeline type a deferred closing mark once nothing has followed it.
         """
-        import numpy as np
-
-        # ── Tuneable thresholds ─────────────────────────────────────────────────
-        MIN_AUDIO_SEC  = 0.35   # (A) clips shorter than this are skipped
-        MIN_RMS_ENERGY = 350    # (B) 16-bit PCM RMS floor; raise if noise still leaks
-
-        # (C-i) Always suppressed — these are never real dictation words
-        HARD_BLOCK = {
-            "um", "uh", "hmm", "hm", "ah", "mm",
-            "mhm", "mm-hmm", "erm", "er",
-        }
-
-        # (C-ii) Suppressed ONLY when clip is also low-energy or very short.
-        # If you actually say these clearly they pass through normally.
-        SOFT_BLOCK = {
-            "yeah", "yep", "yes", "no", "nope",
-            "ok", "okay", "alright", "all right",
-            "right", "sure", "like", "so", "well",
-            "but", "and", "or", "oh", "the", "a", "an",
-            "i", "you", "bye", "thanks", "thank you", "thank",
-        }
-        # A soft-block word is suppressed when energy is below this OR clip is very short.
-        # Think of it as: "did the person actually intend to say this?"
-        SOFT_BLOCK_RMS_THRESHOLD  = 700   # below this = probably noise, not speech
-        SOFT_BLOCK_DUR_THRESHOLD  = 0.55  # below this = probably not an intentional word
-        # ────────────────────────────────────────────────────────────────────────
-
         while True:
             try:
-                pcm_bytes = self._transcribe_queue.get()
-                if pcm_bytes is None:
-                    break
+                item = self._transcribe_queue.get(timeout=0.25)
+            except queue.Empty:
+                try:
+                    self.pipeline.tick()
+                except Exception as e:
+                    logger.error(f"Error in pipeline tick: {e}", exc_info=True)
+                continue
 
-                # ── A: Duration gate ──────────────────────────────────────────
-                duration_sec = len(pcm_bytes) / 32000.0   # 16kHz × 2 bytes
-                if duration_sec < MIN_AUDIO_SEC:
-                    logger.debug(f"🔇 Skipped (too short: {duration_sec:.2f}s)")
-                    self._transcribe_queue.task_done()
-                    continue
-
-                # ── B: Energy gate ────────────────────────────────────────────
-                audio_arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-                rms = float(np.sqrt(np.mean(audio_arr ** 2))) if len(audio_arr) > 0 else 0.0
-                if rms < MIN_RMS_ENERGY:
-                    logger.debug(f"🔇 Skipped (low energy RMS={rms:.0f})")
-                    self._transcribe_queue.task_done()
-                    continue
-
-                # ── Transcribe ─────────────────────────────────────────────────
-                t0 = time.time()
-                raw_text = self.engine.transcribe_wav_bytes(pcm_bytes)
-                elapsed = time.time() - t0
-
-                if raw_text and raw_text.strip():
-                    # ── C: Two-tier word filter ───────────────────────────────
-                    clean = raw_text.strip().lower().rstrip(".,!?")
-
-                    # Hard block — always noise, never real words
-                    if clean in HARD_BLOCK:
-                        logger.debug(f"🔇 Hard-blocked: '{raw_text.strip()}'")
-                        self._transcribe_queue.task_done()
-                        continue
-
-                    # Soft block — only suppress if the audio looked like noise too
-                    if clean in SOFT_BLOCK:
-                        looks_like_noise = (
-                            rms < SOFT_BLOCK_RMS_THRESHOLD or
-                            duration_sec < SOFT_BLOCK_DUR_THRESHOLD
-                        )
-                        if looks_like_noise:
-                            logger.debug(
-                                f"🔇 Soft-blocked (noise-level audio RMS={rms:.0f} "
-                                f"dur={duration_sec:.2f}s): '{raw_text.strip()}'"
-                            )
-                            self._transcribe_queue.task_done()
-                            continue
-                        # Energy and duration look intentional — let it through
-                        logger.debug(f"✅ Soft-block passed (RMS={rms:.0f} dur={duration_sec:.2f}s): '{clean}'")
-
-                    # Apply custom vocabulary replacements
-                    text = self.vocab.apply(raw_text.strip())
-                    logger.info(f"✨ Transcribed in {elapsed:.2f}s (RMS={rms:.0f}): '{text}'")
-
-                    # Inject directly into the active field at cursor
-                    inject_text(text + " ", prefer_paste=self.config.get("prefer_paste", True))
-
-                    # Log to history
-                    self.history.add_entry(text, duration_sec=duration_sec)
-
-                self._transcribe_queue.task_done()
+            if item is None:
+                break
+            try:
+                if item is _FLUSH:
+                    self.pipeline.flush("session end")
+                else:
+                    self.pipeline.process(item)
             except Exception as e:
                 logger.error(f"Error in transcribe worker: {e}", exc_info=True)
-
 
     # ── Dashboard & Orb Settings ──
 
@@ -423,9 +405,23 @@ class DictationApp:
 
         self.vocab.set_replacements(self.config.get("vocabulary", {}))
         self.sounds.enabled = self.config.get("sound_effects", True)
+        sound = (self.config.get("sound_theme", "glass"), self.config.get("sound_volume", 60))
+        if sound != self._applied_sound:          # the dashboard edits the live dict, so compare with what is applied
+            self._applied_sound = sound
+            self.sounds.configure(theme=sound[0], volume=sound[1])
+            self.sounds.play_start()              # let the user hear the change
         self.hotkey.set_trigger_key(self.config.get("trigger_key", "ctrl+space"))
         self.hotkey.set_mode(self.config.get("push_to_talk", False))
-        self.audio.set_device(self.config.get("mic_index"))
+        self.history.enabled = self.config.get("save_history", True)
+        self.audio.set_pause_ms(self.config.get("pause_ms", 700))
+        self.audio.set_voice_gate(self.config.get("voice_gate", True))
+        # The dashboard edits the live config dict in place, so remember what is applied.
+        mic = self.config.get("mic_index")
+        if mic != self._applied_mic:
+            self._applied_mic = mic
+            if self._is_dictating:
+                self._stop_dictation()
+            self.audio.set_device(mic)
 
         self.tray.update_mode_label(
             self.config.get("push_to_talk", False),
@@ -442,13 +438,14 @@ class DictationApp:
 
     def shutdown(self):
         logger.info("Shutting down application...")
-        self.hotkey.stop()
-        self.audio.close_stream()
-        self.engine.stop_server()
         try:
             self._transcribe_queue.put_nowait(None)
         except Exception:
             pass
+        self.hotkey.stop()
+        self.audio.close_stream()
+        self.sounds.close()
+        self.engine.stop_server()
         self.q_app.quit()
 
 
