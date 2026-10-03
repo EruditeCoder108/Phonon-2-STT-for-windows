@@ -54,6 +54,7 @@ from src.ui.hud import CircularOrbHUD
 from src.ui.tray import SystemTray
 from src.ui.dashboard import DashboardWindow
 from src.ui.orb_settings_dialog import OrbSettingsDialog
+from src.ui.icons import get_svg_icon
 
 _FLUSH = object()   # queue marker: finish the current sentence (type any deferred punctuation)
 
@@ -308,64 +309,68 @@ class DictationApp:
     # ── Dashboard & Orb Settings ──
 
     def _show_orb_context_menu(self, global_pos: QPoint):
-        """Displays an ultra-modern Fluent dark context menu when right-clicking the orb."""
+        """Displays a sleek stealth dark context menu when right-clicking the orb."""
         menu = QMenu()
         menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         menu.setStyleSheet("""
             QMenu {
-                background-color: rgba(24, 24, 32, 0.96);
-                border: 1px solid rgba(255, 255, 255, 0.14);
-                border-radius: 12px;
-                padding: 6px;
-                color: #f0f0f5;
+                background-color: #0E0E12;
+                border: 1px solid #202026;
+                border-radius: 8px;
+                padding: 4px;
+                color: #FFFFFF;
                 font-family: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, sans-serif;
-                font-size: 13px;
+                font-size: 12px;
             }
             QMenu::item {
-                padding: 7px 22px 7px 12px;
-                border-radius: 6px;
-                margin: 2px 0;
+                padding: 6px 14px 6px 10px;
+                border-radius: 5px;
+                margin: 1px 0;
             }
             QMenu::item:selected {
-                background-color: rgba(0, 180, 216, 0.22);
-                color: #ffffff;
+                background-color: #1C1C24;
+                color: #FFFFFF;
             }
             QMenu::separator {
                 height: 1px;
-                background: rgba(255, 255, 255, 0.08);
-                margin: 4px 6px;
+                background: #1E1E24;
+                margin: 3px 4px;
             }
         """)
 
         # Dictate action
-        dictate_label = "⏹ Stop Dictation" if self._is_dictating else "🎙 Start Dictation  [Ctrl+Space]"
-        dictate_act = QAction(dictate_label, menu)
+        if self._is_dictating:
+            dictate_act = QAction(get_svg_icon("square", "#E05252", 14), "Stop Dictation", menu)
+        else:
+            dictate_act = QAction(get_svg_icon("mic", "#FFFFFF", 14), "Start Dictation  [Ctrl+Space]", menu)
         dictate_act.triggered.connect(self._toggle_dictation)
         menu.addAction(dictate_act)
 
         # Pause action
-        pause_label = "▶ Resume Dictation" if self._is_paused else "⏸ Pause Dictation"
-        pause_act = QAction(pause_label, menu)
+        if self._is_paused:
+            pause_act = QAction(get_svg_icon("play", "#0078D4", 14), "Resume Dictation", menu)
+        else:
+            pause_act = QAction(get_svg_icon("pause", "#8E8E98", 14), "Pause Dictation", menu)
         pause_act.triggered.connect(self._toggle_pause)
         menu.addAction(pause_act)
 
         menu.addSeparator()
 
         # Orb Settings Customizer
-        orb_act = QAction("🔮 Orb Appearance && Settings...", menu)
+        orb_act = QAction(get_svg_icon("sliders", "#0078D4", 14), "Orb Appearance & Settings...", menu)
         orb_act.triggered.connect(self._open_orb_settings)
         menu.addAction(orb_act)
 
         # Full Dashboard
-        dash_act = QAction("⚡ History && Full Settings...", menu)
+        dash_act = QAction(get_svg_icon("cpu", "#8E8E98", 14), "Speech Control Center...", menu)
         dash_act.triggered.connect(self._open_dashboard)
         menu.addAction(dash_act)
 
         menu.addSeparator()
 
         # Quit App
-        quit_act = QAction("✕ Close / Quit Phonon-2", menu)
+        quit_act = QAction(get_svg_icon("power", "#E05252", 14), "Quit Phonon-2", menu)
         quit_act.triggered.connect(self.shutdown)
         menu.addAction(quit_act)
 

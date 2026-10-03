@@ -1,13 +1,16 @@
 """
-Windows 11 Fluent Dashboard & Settings Control Center
+Windows 11 Stealth Dark Dashboard & Speech Control Center for Phonon-2.
 
-A modern, multi-tab desktop control panel providing:
-1. Dictation & Audio Setup (Device picker, Live VU meter, Sound cues)
-2. Interactive Hotkey Recorder & Mode selector
-3. Custom Vocabulary & Word Replacement Dictionary
-4. Searchable Dictation History with 1-click clipboard copy
-5. Local Engine & System diagnostics
+Features:
+- Pure stealth black / obsidian palette (#0C0C0E) with razor-sharp borders (#202026).
+- 100% vector SVG icons with zero OS emojis.
+- Intelligent scrollable, resize-aware cards avoiding text crushing or layout clipping.
+- Real-time VU meter test, custom hotkey recorder, vocabulary editor, and searchable history.
 """
+
+import os
+import logging
+from typing import Dict
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -17,15 +20,15 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize
 from PySide6.QtGui import QFont, QColor, QIcon, QKeySequence, QKeyEvent
-import logging
-from typing import Dict
 
 from src.config import get_autostart_registry, set_autostart_registry
 from src.core.audio import AudioCaptureEngine
 from src.core.history import HistoryManager
 from src.core.vocabulary import VocabularyEngine
+from src.ui.icons import get_svg_icon, get_svg_pixmap
 
 logger = logging.getLogger(__name__)
+
 
 def _make_label(text: str, role: str = "") -> QLabel:
     lbl = QLabel(text)
@@ -33,6 +36,38 @@ def _make_label(text: str, role: str = "") -> QLabel:
         lbl.setProperty("class", role)
         lbl.setObjectName(role)
     return lbl
+
+
+def _make_scrollable(content_widget: QWidget) -> QScrollArea:
+    """Wraps a content widget in a smooth, responsive, frameless dark scroll container."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setStyleSheet("""
+        QScrollArea {
+            background-color: transparent;
+            border: none;
+        }
+        QScrollBar:vertical {
+            background: #0C0C0E;
+            width: 8px;
+            margin: 4px 2px 4px 2px;
+            border-radius: 4px;
+        }
+        QScrollBar::handle:vertical {
+            background: #2A2A32;
+            min-height: 24px;
+            border-radius: 4px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #3E3E4A;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+    """)
+    scroll.setWidget(content_widget)
+    return scroll
 
 
 # ── Interactive Keypress Capture Widget ──
@@ -49,11 +84,29 @@ class HotkeyRecorderButton(QPushButton):
 
     def _update_text(self):
         if self.is_recording:
-            self.setText("⏺️ Press any key combo now...")
-            self.setStyleSheet("background-color: #6C38E8; color: #FFFFFF; font-weight: bold; padding: 10px; border-radius: 6px;")
+            self.setIcon(get_svg_icon("keyboard", "#FFFFFF", 16))
+            self.setText("  Press any key combination now...")
+            self.setStyleSheet("""
+                background-color: #0078D4;
+                color: #FFFFFF;
+                font-weight: 600;
+                padding: 10px 14px;
+                border-radius: 6px;
+                border: 1px solid #1084D9;
+                text-align: left;
+            """)
         else:
-            self.setText(f"🎹 Current: [{self.current_hotkey.upper()}]  (Click to Change)")
-            self.setStyleSheet("background-color: #212433; color: #E2E4F0; padding: 10px; border-radius: 6px; border: 1px solid #363A50;")
+            self.setIcon(get_svg_icon("keyboard", "#8E8E98", 16))
+            self.setText(f"  Current: [{self.current_hotkey.upper()}]  —  Click to rebind")
+            self.setStyleSheet("""
+                background-color: #151518;
+                color: #D4D4DC;
+                padding: 10px 14px;
+                border-radius: 6px;
+                border: 1px solid #24242C;
+                text-align: left;
+                font-weight: 500;
+            """)
 
     def _start_recording(self):
         self.is_recording = True
@@ -68,11 +121,9 @@ class HotkeyRecorderButton(QPushButton):
         key = event.key()
         modifiers = event.modifiers()
 
-        # Ignore standalone modifier presses
         if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
             return
 
-        # Build key string
         parts = []
         if modifiers & Qt.KeyboardModifier.ControlModifier:
             parts.append("ctrl")
@@ -113,139 +164,184 @@ class DashboardWindow(QMainWindow):
         self.history = history_manager
 
         self.setWindowTitle("Phonon-2 Speech Control Center")
-        self.resize(820, 560)
-        self.setMinimumSize(780, 500)
+        self.resize(860, 580)
+        self.setMinimumSize(760, 480)
 
-        # Dark Fluent Theme Stylesheet
+        # Pure Stealth Dark Stylesheet
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #12131A;
+                background-color: #0C0C0E;
             }
             QWidget#sidebar {
-                background-color: #181924;
-                border-right: 1px solid #252838;
+                background-color: #101014;
+                border-right: 1px solid #1E1E24;
             }
             QListWidget#nav_list {
                 background-color: transparent;
                 border: none;
                 outline: none;
                 font-size: 13px;
-                color: #A0A5BA;
+                color: #8E8E98;
             }
             QListWidget#nav_list::item {
-                padding: 12px 16px;
+                padding: 10px 14px;
                 border-radius: 6px;
-                margin: 3px 8px;
+                margin: 2px 6px;
             }
             QListWidget#nav_list::item:hover {
-                background-color: #222434;
+                background-color: #18181E;
                 color: #FFFFFF;
             }
             QListWidget#nav_list::item:selected {
-                background-color: #5833C7;
+                background-color: #1C1C24;
                 color: #FFFFFF;
-                font-weight: bold;
+                font-weight: 600;
+                border-left: 3px solid #0078D4;
             }
             QWidget#content_area {
-                background-color: #12131A;
+                background-color: #0C0C0E;
             }
             QFrame.card {
-                background-color: #191B26;
-                border: 1px solid #282B3E;
-                border-radius: 10px;
-                padding: 16px;
+                background-color: #141418;
+                border: 1px solid #202026;
+                border-radius: 8px;
+                padding: 14px 16px;
             }
             QLabel.title {
-                font-size: 19px;
-                font-weight: bold;
+                font-size: 18px;
+                font-weight: 700;
                 color: #FFFFFF;
+                font-family: 'Segoe UI Variable Text', 'Segoe UI', sans-serif;
             }
             QLabel.subtitle {
                 font-size: 12px;
-                color: #8C92A8;
+                color: #727280;
+                margin-bottom: 2px;
             }
             QLabel.section {
-                font-size: 14px;
+                font-size: 12px;
                 font-weight: 600;
-                color: #E0E3F0;
-                margin-top: 4px;
+                color: #B4B4C0;
+                margin-top: 2px;
             }
             QLabel.body {
                 font-size: 12px;
-                color: #A6ACBE;
+                color: #8C8C9A;
             }
             QComboBox {
-                background-color: #212433;
-                border: 1px solid #33374C;
+                background-color: #18181E;
+                border: 1px solid #282832;
                 border-radius: 6px;
-                padding: 8px 12px;
+                padding: 7px 10px;
                 color: #FFFFFF;
-                font-size: 13px;
+                font-size: 12px;
             }
             QComboBox:hover {
-                border-color: #6C38E8;
+                border-color: #383846;
+            }
+            QComboBox:focus {
+                border-color: #0078D4;
             }
             QComboBox QAbstractItemView {
-                background-color: #1E202E;
+                background-color: #141418;
+                border: 1px solid #282832;
                 color: #FFFFFF;
-                selection-background-color: #5833C7;
+                selection-background-color: #0078D4;
             }
             QLineEdit {
-                background-color: #212433;
-                border: 1px solid #33374C;
+                background-color: #18181E;
+                border: 1px solid #282832;
                 border-radius: 6px;
-                padding: 8px 12px;
+                padding: 7px 10px;
                 color: #FFFFFF;
-                font-size: 13px;
+                font-size: 12px;
             }
             QLineEdit:focus {
-                border-color: #6C38E8;
+                border-color: #0078D4;
             }
             QPushButton.primary {
-                background-color: #6236DE;
+                background-color: #0078D4;
                 color: #FFFFFF;
                 font-weight: 600;
-                padding: 9px 18px;
-                border-radius: 6px;
-                border: none;
-            }
-            QPushButton.primary:hover {
-                background-color: #7345F2;
-            }
-            QPushButton.secondary {
-                background-color: #26293A;
-                color: #D5D9E8;
                 padding: 8px 16px;
                 border-radius: 6px;
-                border: 1px solid #3A3E56;
+                border: 1px solid #1084D9;
+                font-size: 12px;
+            }
+            QPushButton.primary:hover {
+                background-color: #1084D9;
+            }
+            QPushButton.secondary {
+                background-color: #18181E;
+                color: #D4D4DC;
+                padding: 7px 14px;
+                border-radius: 6px;
+                border: 1px solid #282832;
+                font-size: 12px;
+                font-weight: 500;
             }
             QPushButton.secondary:hover {
-                background-color: #34384E;
+                background-color: #22222A;
+                border-color: #383846;
             }
             QProgressBar {
-                background-color: #212433;
-                border: 1px solid #33374C;
-                border-radius: 4px;
-                height: 10px;
+                background-color: #18181E;
+                border: 1px solid #282832;
+                border-radius: 3px;
+                height: 8px;
                 text-align: center;
             }
             QProgressBar::chunk {
-                background-color: #2ED573;
-                border-radius: 3px;
+                background-color: #0078D4;
+                border-radius: 2px;
             }
             QTableWidget {
-                background-color: #191B26;
-                border: 1px solid #282B3E;
-                border-radius: 8px;
+                background-color: #141418;
+                border: 1px solid #202026;
+                border-radius: 6px;
                 color: #FFFFFF;
-                gridline-color: #252838;
+                gridline-color: #1C1C22;
             }
             QHeaderView::section {
-                background-color: #212433;
-                color: #A0A5BA;
-                padding: 6px;
+                background-color: #18181E;
+                color: #8E8E98;
+                padding: 6px 10px;
                 border: none;
-                font-weight: bold;
+                font-weight: 600;
+                font-size: 11px;
+            }
+            QCheckBox {
+                color: #B4B4C0;
+                font-size: 12px;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid #33333E;
+                background: #141418;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0078D4;
+                border-color: #0078D4;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                background: #1C1C22;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #0078D4;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #FFFFFF;
+                border: 1px solid #444450;
+                width: 14px;
+                margin-top: -5px;
+                margin-bottom: -5px;
+                border-radius: 7px;
             }
         """)
 
@@ -259,31 +355,48 @@ class DashboardWindow(QMainWindow):
         # ── Sidebar Navigation ──
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(210)
+        sidebar.setFixedWidth(200)
         s_layout = QVBoxLayout(sidebar)
-        s_layout.setContentsMargins(10, 20, 10, 20)
+        s_layout.setContentsMargins(8, 16, 8, 16)
+        s_layout.setSpacing(6)
 
-        brand_title = QLabel("⚡ Phonon-2")
-        brand_title.setStyleSheet("font-size: 17px; font-weight: bold; color: #FFFFFF; padding-left: 12px;")
-        brand_sub = QLabel("Native Local Speech")
-        brand_sub.setStyleSheet("font-size: 11px; color: #7B8196; padding-left: 12px; margin-bottom: 12px;")
-        s_layout.addWidget(brand_title)
-        s_layout.addWidget(brand_sub)
+        # Brand header
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(8, 4, 8, 8)
+        brand_icon = QLabel()
+        icon_path = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "icon.png")
+        if os.path.exists(icon_path):
+            brand_icon.setPixmap(QIcon(icon_path).pixmap(20, 20))
+        else:
+            brand_icon.setPixmap(get_svg_pixmap("mic", "#0078D4", 20))
+        brand_title = QLabel("Phonon-2")
+        brand_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #FFFFFF;")
+        brand_row.addWidget(brand_icon)
+        brand_row.addWidget(brand_title)
+        brand_row.addStretch()
+        s_layout.addLayout(brand_row)
 
         self.nav_list = QListWidget()
         self.nav_list.setObjectName("nav_list")
-        self.nav_list.addItem("🎙️  Audio & Voice")
-        self.nav_list.addItem("⌨️  Hotkeys & Trigger")
-        self.nav_list.addItem("📖  Custom Vocabulary")
-        self.nav_list.addItem("📜  Dictation History")
-        self.nav_list.addItem("⚡  Engine & About")
+
+        items_spec = [
+            ("Audio & Voice", "mic"),
+            ("Hotkeys & Trigger", "keyboard"),
+            ("Custom Vocabulary", "book"),
+            ("Dictation History", "history"),
+            ("Engine & Info", "cpu"),
+        ]
+        for title, icon_name in items_spec:
+            item = QListWidgetItem(get_svg_icon(icon_name, "#A0A0AC", 16), title)
+            self.nav_list.addItem(item)
+
         self.nav_list.setCurrentRow(0)
         self.nav_list.currentRowChanged.connect(self._on_tab_changed)
         s_layout.addWidget(self.nav_list)
         s_layout.addStretch()
 
-        save_status_label = QLabel("Auto-saved to config")
-        save_status_label.setStyleSheet("color: #555A6E; font-size: 11px; text-align: center; padding-left: 12px;")
+        save_status_label = QLabel("Settings auto-saved")
+        save_status_label.setStyleSheet("color: #4A4A56; font-size: 11px; padding-left: 10px; margin-bottom: 4px;")
         s_layout.addWidget(save_status_label)
 
         main_layout.addWidget(sidebar)
@@ -320,18 +433,19 @@ class DashboardWindow(QMainWindow):
     def _build_audio_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(18)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
 
-        layout.addWidget(_make_label("Microphone & Audio Input", "title"))
-        layout.addWidget(_make_label("Select your input microphone and test sensitivity in real time.", "subtitle"))
+        layout.addWidget(_make_label("Audio & Speech Input", "title"))
+        layout.addWidget(_make_label("Configure microphone capture, audio feedback cues, and speech filtering.", "subtitle"))
 
-        card = QFrame()
-        card.setProperty("class", "card")
-        c_layout = QVBoxLayout(card)
-        c_layout.setSpacing(14)
+        # Card 1: Input Device & Live Test
+        card_dev = QFrame()
+        card_dev.setProperty("class", "card")
+        c_layout = QVBoxLayout(card_dev)
+        c_layout.setSpacing(10)
 
-        c_layout.addWidget(_make_label("Active Input Device:", "section"))
+        c_layout.addWidget(_make_label("Input Microphone", "section"))
         self.mic_combo = QComboBox()
         self.mic_combo.addItem("Default System Microphone", -1)
 
@@ -348,94 +462,135 @@ class DashboardWindow(QMainWindow):
         self.mic_combo.currentIndexChanged.connect(self._save_audio_settings)
         c_layout.addWidget(self.mic_combo)
 
-        # Real-time VU meter
-        c_layout.addWidget(_make_label("Live Audio Level Test:", "section"))
+        # Real-time VU meter test
+        meter_row = QHBoxLayout()
+        meter_row.setSpacing(10)
         self.vu_meter = QProgressBar()
         self.vu_meter.setRange(0, 100)
         self.vu_meter.setValue(0)
-        c_layout.addWidget(self.vu_meter)
+        self.vu_meter.setFixedHeight(8)
+        meter_row.addWidget(self.vu_meter, 1)
 
-        self.test_mic_btn = QPushButton("🎙️ Start Microphone Test")
+        self.test_mic_btn = QPushButton("Test Mic")
+        self.test_mic_btn.setIcon(get_svg_icon("mic", "#FFFFFF", 14))
         self.test_mic_btn.setProperty("class", "secondary")
+        self.test_mic_btn.setFixedHeight(30)
         self.test_mic_btn.clicked.connect(self._toggle_mic_test)
-        c_layout.addWidget(self.test_mic_btn)
+        meter_row.addWidget(self.test_mic_btn)
+        c_layout.addLayout(meter_row)
+        layout.addWidget(card_dev)
 
-        layout.addWidget(card)
+        # Card 2: Audio Cues & Sound
+        card_snd = QFrame()
+        card_snd.setProperty("class", "card")
+        s_layout = QVBoxLayout(card_snd)
+        s_layout.setSpacing(10)
 
-        # Options card
-        opt_card = QFrame()
-        opt_card.setProperty("class", "card")
-        opt_layout = QVBoxLayout(opt_card)
-        opt_layout.setSpacing(10)
-
-        self.chime_check = QCheckBox("Play sound cues (ready, start, stop)")
+        self.chime_check = QCheckBox("Play subtle sound cues on start, stop, and ready")
         self.chime_check.setChecked(self.config.get("sound_effects", True))
         self.chime_check.toggled.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.chime_check)
+        s_layout.addWidget(self.chime_check)
 
-        opt_layout.addWidget(_make_label("Sound style:", "section"))
+        snd_row = QHBoxLayout()
+        snd_row.setSpacing(12)
+
+        col_theme = QVBoxLayout()
+        col_theme.setSpacing(4)
+        col_theme.addWidget(_make_label("Sound Style", "section"))
         self.sound_theme_combo = QComboBox()
-        for label, key in (("Glass - soft and clear", "glass"), ("Wood - warm and rounded", "wood"),
-                           ("Air - smooth and minimal", "air")):
+        for label, key in (("Glass (Clear & Soft)", "glass"), ("Wood (Warm & Rounded)", "wood"), ("Air (Minimal)", "air")):
             self.sound_theme_combo.addItem(label, key)
         idx = self.sound_theme_combo.findData(self.config.get("sound_theme", "glass"))
         self.sound_theme_combo.setCurrentIndex(max(0, idx))
         self.sound_theme_combo.currentIndexChanged.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.sound_theme_combo)
+        col_theme.addWidget(self.sound_theme_combo)
+        snd_row.addLayout(col_theme, 1)
 
-        vol_row = QHBoxLayout()
-        vol_row.addWidget(_make_label("Cue volume:", "section"))
+        col_vol = QVBoxLayout()
+        col_vol.setSpacing(4)
+        vol_hdr = QHBoxLayout()
+        vol_hdr.addWidget(_make_label("Cue Volume", "section"))
+        vol_hdr.addStretch()
+        self.sound_volume_label = QLabel(f"{int(self.config.get('sound_volume', 60))}%")
+        self.sound_volume_label.setStyleSheet("color: #0078D4; font-weight: 600; font-size: 11px;")
+        vol_hdr.addWidget(self.sound_volume_label)
+        col_vol.addLayout(vol_hdr)
+
         self.sound_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.sound_volume_slider.setRange(0, 100)
         self.sound_volume_slider.setValue(int(self.config.get("sound_volume", 60)))
-        self.sound_volume_label = QLabel(f"{self.sound_volume_slider.value()}%")
         self.sound_volume_slider.valueChanged.connect(lambda v: self.sound_volume_label.setText(f"{v}%"))
-        self.sound_volume_slider.sliderReleased.connect(self._save_audio_settings)   # preview plays on release
-        vol_row.addWidget(self.sound_volume_slider, 1)
-        vol_row.addWidget(self.sound_volume_label)
-        opt_layout.addLayout(vol_row)
+        self.sound_volume_slider.sliderReleased.connect(self._save_audio_settings)
+        col_vol.addWidget(self.sound_volume_slider)
+        snd_row.addLayout(col_vol, 1)
 
-        self.startup_check = QCheckBox("Start Phonon-2 automatically on Windows startup (minimized)")
-        self.startup_check.setChecked(get_autostart_registry())
-        self.startup_check.toggled.connect(self._on_startup_toggled)
-        opt_layout.addWidget(self.startup_check)
+        s_layout.addLayout(snd_row)
+        layout.addWidget(card_snd)
 
-        self.history_check = QCheckBox("Save dictated text to history on this PC (turn off if you dictate sensitive text)")
-        self.history_check.setChecked(self.config.get("save_history", True))
-        self.history_check.toggled.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.history_check)
+        # Card 3: Speech Filters & Cadence
+        card_filt = QFrame()
+        card_filt.setProperty("class", "card")
+        f_layout = QVBoxLayout(card_filt)
+        f_layout.setSpacing(8)
 
-        self.stitch_check = QCheckBox("Smart sentence joining (fixes stray periods and capitals when you pause mid-sentence)")
+        f_layout.addWidget(_make_label("Speech Filtering & Cadence", "section"))
+
+        self.stitch_check = QCheckBox("Smart sentence joining (reconnect mid-sentence pauses)")
         self.stitch_check.setChecked(self.config.get("context_stitch", True))
         self.stitch_check.toggled.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.stitch_check)
+        f_layout.addWidget(self.stitch_check)
 
-        self.gate_check = QCheckBox("Ignore quiet background voices (video, TV, people nearby) - speak at your normal volume")
+        self.gate_check = QCheckBox("Voice gate (ignore quiet background chatter && ambient noise)")
         self.gate_check.setChecked(self.config.get("voice_gate", True))
         self.gate_check.toggled.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.gate_check)
+        f_layout.addWidget(self.gate_check)
 
-        self.filler_check = QCheckBox("Remove \"uh\" / \"um\" from the typed text")
+        self.filler_check = QCheckBox("Strip filler vocalizations (\"uh\", \"um\") from typed text")
         self.filler_check.setChecked(self.config.get("remove_fillers", True))
         self.filler_check.toggled.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.filler_check)
+        f_layout.addWidget(self.filler_check)
 
-        opt_layout.addWidget(_make_label("Pause length that ends a phrase:", "section"))
+        pause_row = QHBoxLayout()
+        pause_row.setSpacing(8)
+        pause_lbl = QLabel("Phrase End Timeout:")
+        pause_lbl.setStyleSheet("color: #B4B4C0; font-size: 12px;")
+        pause_row.addWidget(pause_lbl)
+
         self.pause_combo = QComboBox()
-        for label, ms in (("Quick - 500 ms (snappy, may split long sentences)", 500),
-                          ("Balanced - 700 ms (recommended)", 700),
-                          ("Relaxed - 1000 ms (for slow, thoughtful speech)", 1000),
-                          ("Patient - 1400 ms", 1400)):
+        for label, ms in (("Quick — 500 ms (rapid typing)", 500),
+                          ("Balanced — 700 ms (recommended)", 700),
+                          ("Relaxed — 1000 ms (thoughtful speech)", 1000),
+                          ("Patient — 1400 ms (long pauses)", 1400)):
             self.pause_combo.addItem(label, ms)
         cur_ms = self.config.get("pause_ms", 700)
         self.pause_combo.setCurrentIndex(min(range(self.pause_combo.count()),
                                              key=lambda i: abs(self.pause_combo.itemData(i) - cur_ms)))
         self.pause_combo.currentIndexChanged.connect(self._save_audio_settings)
-        opt_layout.addWidget(self.pause_combo)
+        pause_row.addWidget(self.pause_combo, 1)
+        f_layout.addLayout(pause_row)
 
-        layout.addWidget(opt_card)
+        layout.addWidget(card_filt)
+
+        # Card 4: General Preferences
+        card_gen = QFrame()
+        card_gen.setProperty("class", "card")
+        g_layout = QVBoxLayout(card_gen)
+        g_layout.setSpacing(8)
+
+        self.startup_check = QCheckBox("Start Phonon-2 automatically on Windows startup (minimized)")
+        self.startup_check.setChecked(get_autostart_registry())
+        self.startup_check.toggled.connect(self._on_startup_toggled)
+        g_layout.addWidget(self.startup_check)
+
+        self.history_check = QCheckBox("Save dictated text to local history on this PC")
+        self.history_check.setChecked(self.config.get("save_history", True))
+        self.history_check.toggled.connect(self._save_audio_settings)
+        g_layout.addWidget(self.history_check)
+
+        layout.addWidget(card_gen)
         layout.addStretch()
-        return container
+
+        return _make_scrollable(container)
 
     def _on_startup_toggled(self, enabled: bool):
         set_autostart_registry(enabled)
@@ -444,7 +599,6 @@ class DashboardWindow(QMainWindow):
 
     def _toggle_mic_test(self):
         if self.test_audio_engine is None:
-            # Start live test
             mic_data = self.mic_combo.currentData()
             mic_idx = None if mic_data == -1 else mic_data
             self.current_live_level = 0.0
@@ -455,16 +609,17 @@ class DashboardWindow(QMainWindow):
             self.test_audio_engine = AudioCaptureEngine(device_index=mic_idx, on_level_update=_on_lvl)
             self.test_audio_engine.start()
             self.vu_timer.start(30)
-            self.test_mic_btn.setText("⏹️ Stop Microphone Test")
-            self.test_mic_btn.setStyleSheet("background-color: #B33939; color: #FFFFFF;")
+            self.test_mic_btn.setIcon(get_svg_icon("square", "#FFFFFF", 14))
+            self.test_mic_btn.setText("Stop Test")
+            self.test_mic_btn.setStyleSheet("background-color: #A32020; color: #FFFFFF; border-color: #C42B1C;")
         else:
-            # Stop test
             self.vu_timer.stop()
             self.test_audio_engine.stop()
             self.test_audio_engine.close_stream()
             self.test_audio_engine = None
             self.vu_meter.setValue(0)
-            self.test_mic_btn.setText("🎙️ Start Microphone Test")
+            self.test_mic_btn.setIcon(get_svg_icon("mic", "#FFFFFF", 14))
+            self.test_mic_btn.setText("Test Mic")
             self.test_mic_btn.setStyleSheet("")
 
     def _update_live_vu(self):
@@ -488,24 +643,25 @@ class DashboardWindow(QMainWindow):
     def _build_hotkey_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(18)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
 
         layout.addWidget(_make_label("Trigger Key & Activation Mode", "title"))
-        layout.addWidget(_make_label("Choose how dictation is triggered from any application.", "subtitle"))
+        layout.addWidget(_make_label("Configure global hotkeys and choose between push-to-talk or continuous toggle.", "subtitle"))
 
         card = QFrame()
         card.setProperty("class", "card")
         c_layout = QVBoxLayout(card)
-        c_layout.setSpacing(14)
+        c_layout.setSpacing(12)
 
-        c_layout.addWidget(_make_label("Global Trigger Hotkey:", "section"))
+        c_layout.addWidget(_make_label("Global Trigger Hotkey", "section"))
         self.recorder_btn = HotkeyRecorderButton(current_hotkey=self.config.get("trigger_key", "ctrl+space"))
         self.recorder_btn.hotkey_recorded.connect(self._on_hotkey_changed)
         c_layout.addWidget(self.recorder_btn)
 
-        c_layout.addWidget(_make_label("Quick Presets:", "section"))
+        c_layout.addWidget(_make_label("Quick Presets", "section"))
         preset_layout = QHBoxLayout()
+        preset_layout.setSpacing(8)
         for label, key_val in [("Ctrl + Space", "ctrl+space"), ("Caps Lock", "capslock"), ("Right Alt", "ralt"), ("F8", "f8")]:
             btn = QPushButton(label)
             btn.setProperty("class", "secondary")
@@ -513,9 +669,9 @@ class DashboardWindow(QMainWindow):
             preset_layout.addWidget(btn)
         c_layout.addLayout(preset_layout)
 
-        c_layout.addWidget(_make_label("Activation Mode:", "section"))
-        self.toggle_mode_btn = QPushButton("Toggle Mode (Press once to start, press again to stop)")
-        self.ptt_mode_btn = QPushButton("Push-to-Talk (Hold key down while speaking, release to stop)")
+        c_layout.addWidget(_make_label("Activation Behavior", "section"))
+        self.toggle_mode_btn = QPushButton("Toggle Mode  (Press once to start, press again to stop)")
+        self.ptt_mode_btn = QPushButton("Push-to-Talk  (Hold hotkey while speaking, release to stop)")
 
         self.toggle_mode_btn.setProperty("class", "secondary")
         self.ptt_mode_btn.setProperty("class", "secondary")
@@ -529,7 +685,8 @@ class DashboardWindow(QMainWindow):
         self._refresh_mode_buttons()
         layout.addWidget(card)
         layout.addStretch()
-        return container
+
+        return _make_scrollable(container)
 
     def _set_mode(self, is_ptt: bool):
         self.config["push_to_talk"] = is_ptt
@@ -539,10 +696,10 @@ class DashboardWindow(QMainWindow):
     def _refresh_mode_buttons(self):
         is_ptt = self.config.get("push_to_talk", False)
         if is_ptt:
-            self.ptt_mode_btn.setStyleSheet("background-color: #5833C7; color: #FFFFFF; font-weight: bold;")
+            self.ptt_mode_btn.setStyleSheet("background-color: #0078D4; color: #FFFFFF; font-weight: 600; border-color: #1084D9;")
             self.toggle_mode_btn.setStyleSheet("")
         else:
-            self.toggle_mode_btn.setStyleSheet("background-color: #5833C7; color: #FFFFFF; font-weight: bold;")
+            self.toggle_mode_btn.setStyleSheet("background-color: #0078D4; color: #FFFFFF; font-weight: 600; border-color: #1084D9;")
             self.ptt_mode_btn.setStyleSheet("")
 
     def _on_hotkey_changed(self, new_key: str):
@@ -555,25 +712,25 @@ class DashboardWindow(QMainWindow):
     def _build_vocab_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(14)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
 
-        layout.addWidget(_make_label("Custom Vocabulary & Replacements", "title"))
-        layout.addWidget(_make_label("Automatically replace phonetic words with custom terms, names, or abbreviations.", "subtitle"))
+        layout.addWidget(_make_label("Custom Vocabulary Replacements", "title"))
+        layout.addWidget(_make_label("Automatically rewrite spoken phonetic phrases into formatted names, brands, or shortcuts.", "subtitle"))
 
-        # Add rule bar
         add_card = QFrame()
         add_card.setProperty("class", "card")
         a_layout = QHBoxLayout(add_card)
-        a_layout.setSpacing(10)
+        a_layout.setSpacing(8)
 
         self.vocab_input_spoken = QLineEdit()
-        self.vocab_input_spoken.setPlaceholderText("When you say (e.g. 'hi fa')")
+        self.vocab_input_spoken.setPlaceholderText("Spoken phrase (e.g. 'dot com')")
 
         self.vocab_input_written = QLineEdit()
-        self.vocab_input_written.setPlaceholderText("Replace with (e.g. 'HIFA')")
+        self.vocab_input_written.setPlaceholderText("Replace with (e.g. '.com')")
 
-        add_btn = QPushButton("➕ Add Rule")
+        add_btn = QPushButton("Add Rule")
+        add_btn.setIcon(get_svg_icon("plus", "#FFFFFF", 14))
         add_btn.setProperty("class", "primary")
         add_btn.clicked.connect(self._add_vocab_rule)
 
@@ -585,7 +742,7 @@ class DashboardWindow(QMainWindow):
         # Rules Table
         self.vocab_table = QTableWidget()
         self.vocab_table.setColumnCount(3)
-        self.vocab_table.setHorizontalHeaderLabels(["Spoken Phrase", "Replaced With", "Action"])
+        self.vocab_table.setHorizontalHeaderLabels(["When You Say", "Replace With", "Action"])
         self.vocab_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.vocab_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.vocab_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
@@ -593,6 +750,7 @@ class DashboardWindow(QMainWindow):
 
         self._refresh_vocab_table()
         layout.addWidget(self.vocab_table)
+
         return container
 
     def _refresh_vocab_table(self):
@@ -604,6 +762,7 @@ class DashboardWindow(QMainWindow):
             self.vocab_table.setItem(row, 1, QTableWidgetItem(written))
 
             del_btn = QPushButton("Delete")
+            del_btn.setIcon(get_svg_icon("trash", "#E05252", 12))
             del_btn.setProperty("class", "secondary")
             del_btn.clicked.connect(lambda _, k=spoken: self._delete_vocab_rule(k))
             self.vocab_table.setCellWidget(row, 2, del_btn)
@@ -635,8 +794,8 @@ class DashboardWindow(QMainWindow):
     def _build_history_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(14)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
 
         header_layout = QHBoxLayout()
         header_text = QVBoxLayout()
@@ -645,7 +804,8 @@ class DashboardWindow(QMainWindow):
         header_layout.addLayout(header_text)
         header_layout.addStretch()
 
-        clear_btn = QPushButton("🗑️ Clear History")
+        clear_btn = QPushButton("Clear History")
+        clear_btn.setIcon(get_svg_icon("trash", "#E05252", 14))
         clear_btn.setProperty("class", "secondary")
         clear_btn.clicked.connect(self._clear_history)
         header_layout.addWidget(clear_btn)
@@ -653,7 +813,7 @@ class DashboardWindow(QMainWindow):
 
         # Search Bar
         self.history_search = QLineEdit()
-        self.history_search.setPlaceholderText("🔍 Search past dictations...")
+        self.history_search.setPlaceholderText("Search past dictations...")
         self.history_search.textChanged.connect(self._filter_history)
         layout.addWidget(self.history_search)
 
@@ -664,7 +824,7 @@ class DashboardWindow(QMainWindow):
 
         self.history_list_widget = QWidget()
         self.history_list_layout = QVBoxLayout(self.history_list_widget)
-        self.history_list_layout.setSpacing(10)
+        self.history_list_layout.setSpacing(8)
         self.history_scroll.setWidget(self.history_list_widget)
 
         layout.addWidget(self.history_scroll)
@@ -672,7 +832,6 @@ class DashboardWindow(QMainWindow):
         return container
 
     def _refresh_history_tab(self):
-        # Clear existing items
         while self.history_list_layout.count():
             child = self.history_list_layout.takeAt(0)
             if child.widget():
@@ -690,17 +849,18 @@ class DashboardWindow(QMainWindow):
             card = QFrame()
             card.setProperty("class", "card")
             c_layout = QVBoxLayout(card)
-            c_layout.setSpacing(8)
+            c_layout.setSpacing(6)
 
             meta_layout = QHBoxLayout()
-            meta_label = QLabel(f"⏱️ {entry.get('timestamp', '')}  •  {entry.get('words', 0)} words  •  {entry.get('duration', 0)}s")
-            meta_label.setStyleSheet("color: #7B8196; font-size: 11px;")
+            meta_label = QLabel(f"{entry.get('timestamp', '')}  •  {entry.get('words', 0)} words  •  {entry.get('duration', 0)}s")
+            meta_label.setStyleSheet("color: #727280; font-size: 11px;")
             meta_layout.addWidget(meta_label)
             meta_layout.addStretch()
 
-            copy_btn = QPushButton("📋 Copy")
+            copy_btn = QPushButton("Copy")
+            copy_btn.setIcon(get_svg_icon("copy", "#D4D4DC", 12))
             copy_btn.setProperty("class", "secondary")
-            copy_btn.setFixedWidth(75)
+            copy_btn.setFixedWidth(80)
             copy_btn.clicked.connect(lambda _, t=text: self._copy_to_clipboard(t))
             meta_layout.addWidget(copy_btn)
             c_layout.addLayout(meta_layout)
@@ -715,7 +875,7 @@ class DashboardWindow(QMainWindow):
 
         if matched == 0:
             empty_label = QLabel("No dictation history found.")
-            empty_label.setStyleSheet("color: #6C7286; font-size: 13px; text-align: center; margin-top: 30px;")
+            empty_label.setStyleSheet("color: #555562; font-size: 13px; text-align: center; margin-top: 30px;")
             self.history_list_layout.addWidget(empty_label)
 
         self.history_list_layout.addStretch()
@@ -734,33 +894,33 @@ class DashboardWindow(QMainWindow):
     def _build_about_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(16)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
 
-        layout.addWidget(_make_label("Phonon-2 Speech Engine Diagnostics", "title"))
-        layout.addWidget(_make_label("System information and local inference architecture.", "subtitle"))
+        layout.addWidget(_make_label("Engine & Architecture Diagnostics", "title"))
+        layout.addWidget(_make_label("Local inference architecture, runtime acceleration, and daemon endpoints.", "subtitle"))
 
         info_card = QFrame()
         info_card.setProperty("class", "card")
         i_layout = QVBoxLayout(info_card)
-        i_layout.setSpacing(12)
+        i_layout.setSpacing(10)
 
         items = [
-            ("Model Architecture", "Phonon-2 (Ternary Quantized Parakeet-TDT 0.6B)"),
-            ("Model Download Footprint", "164 MB (12 pinned weight shards)"),
-            ("Word Error Rate (WER)", "5.21% (State of the art in <1GB tier)"),
-            ("CPU Acceleration Tier", "Intel/AMD AVX-512 VNNI Vector Acceleration"),
-            ("Execution Mode", "100% Offline Local Inference (Zero telemetry)"),
-            ("Local Daemon", f"http://127.0.0.1:{self.config.get('port', 8010)}"),
-            ("Streaming Protocol", f"WebSocket ws://127.0.0.1:{self.config.get('port', 8010)}/v1/audio/stream"),
+            ("Speech Model Architecture", "Phonon-2 (Ternary Quantized Parakeet-TDT 0.6B)"),
+            ("Model Weight Footprint", "164 MB (12 pinned quantized shards)"),
+            ("Word Error Rate (WER)", "5.21% (Zero cloud telemetry)"),
+            ("Hardware Acceleration", "Intel/AMD AVX-512 / AVX2 Vector Acceleration"),
+            ("Execution Mode", "100% Offline Local Inference"),
+            ("Local HTTP Daemon", f"http://127.0.0.1:{self.config.get('port', 8010)}"),
+            ("Local WebSocket Stream", f"ws://127.0.0.1:{self.config.get('port', 8010)}/v1/audio/stream"),
         ]
 
         for title, val in items:
             row = QHBoxLayout()
             t_label = QLabel(title)
-            t_label.setStyleSheet("color: #A0A5BA; font-size: 13px; font-weight: 500;")
+            t_label.setStyleSheet("color: #8E8E98; font-size: 12px; font-weight: 500;")
             v_label = QLabel(val)
-            v_label.setStyleSheet("color: #FFFFFF; font-size: 13px; font-weight: 600;")
+            v_label.setStyleSheet("color: #FFFFFF; font-size: 12px; font-weight: 600;")
             row.addWidget(t_label)
             row.addStretch()
             row.addWidget(v_label)
@@ -768,4 +928,5 @@ class DashboardWindow(QMainWindow):
 
         layout.addWidget(info_card)
         layout.addStretch()
-        return container
+
+        return _make_scrollable(container)

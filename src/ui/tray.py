@@ -15,7 +15,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def create_tray_icon_pixmap(color: QColor = QColor(140, 90, 255)) -> QPixmap:
+from src.ui.icons import get_svg_icon
+
+
+def create_tray_icon_pixmap(color: QColor = QColor(0, 120, 212)) -> QPixmap:
     """Dynamically generates a clean, modern high-DPI tray icon."""
     pixmap = QPixmap(32, 32)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -60,6 +63,31 @@ class SystemTray(QObject):
         self.tray_icon.setToolTip("Phonon-2 System Dictation")
 
         self.menu = QMenu()
+        self.menu.setStyleSheet("""
+            QMenu {
+                background-color: #0E0E12;
+                border: 1px solid #202026;
+                border-radius: 8px;
+                padding: 4px;
+                color: #FFFFFF;
+                font-family: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, sans-serif;
+                font-size: 12px;
+            }
+            QMenu::item {
+                padding: 6px 14px 6px 10px;
+                border-radius: 5px;
+                margin: 1px 0;
+            }
+            QMenu::item:selected {
+                background-color: #1C1C24;
+                color: #FFFFFF;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #1E1E24;
+                margin: 3px 4px;
+            }
+        """)
         self._build_menu()
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self._on_activated)
@@ -72,33 +100,40 @@ class SystemTray(QObject):
         self.menu.clear()
 
         # Status item (disabled, informational)
-        self.status_action = QAction("● Phonon-2 Ready", self.menu)
+        self.status_action = QAction("Phonon-2 Ready", self.menu)
+        self.status_action.setIcon(get_svg_icon("check", "#2ED573", 14))
         self.status_action.setEnabled(False)
         self.menu.addAction(self.status_action)
 
         self.menu.addSeparator()
 
-        self.orb_action = QAction("🔮 Orb Appearance && Settings...", self.menu)
+        self.orb_action = QAction("Orb Appearance & Settings...", self.menu)
+        self.orb_action.setIcon(get_svg_icon("sliders", "#0078D4", 14))
         self.orb_action.triggered.connect(self.orb_settings_requested.emit)
         self.menu.addAction(self.orb_action)
 
-        self.dashboard_action = QAction("⚡ Open Dashboard...", self.menu)
+        self.dashboard_action = QAction("Speech Control Center...", self.menu)
+        self.dashboard_action.setIcon(get_svg_icon("cpu", "#8E8E98", 14))
         self.dashboard_action.triggered.connect(self.settings_requested.emit)
         self.menu.addAction(self.dashboard_action)
 
         self.mode_action = QAction("Mode: Push-to-Talk", self.menu)
+        self.mode_action.setIcon(get_svg_icon("keyboard", "#8E8E98", 14))
         self.mode_action.triggered.connect(self.toggle_mode_requested.emit)
         self.menu.addAction(self.mode_action)
 
         self.menu.addSeparator()
 
         self.quit_action = QAction("Quit Phonon-2", self.menu)
+        self.quit_action.setIcon(get_svg_icon("power", "#E05252", 14))
         self.quit_action.triggered.connect(self.quit_requested.emit)
         self.menu.addAction(self.quit_action)
 
     def set_status(self, text: str, is_active: bool = True):
-        color_dot = "●" if is_active else "○"
-        self.status_action.setText(f"{color_dot} {text}")
+        color = "#2ED573" if is_active else "#8E8E98"
+        icon_name = "check" if is_active else "clock"
+        self.status_action.setIcon(get_svg_icon(icon_name, color, 14))
+        self.status_action.setText(text)
 
     def update_mode_label(self, is_push_to_talk: bool, key_name: str):
         mode_str = "Push-to-Talk" if is_push_to_talk else "Toggle"
