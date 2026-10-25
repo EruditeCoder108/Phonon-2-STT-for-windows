@@ -10,6 +10,18 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".phonon2_config.json")
 
+DEFAULT_PHONON_MODEL = "phonon-2.5-en"
+PHONON_MODELS = {
+    "phonon-2.5-en": "Phonon-2.5 English",
+    "phonon-2.5": "Phonon-2.5 • 25 languages",
+    "phonon-2": "Phonon-2 • legacy",
+}
+PHONON_MODEL_REPOS = {
+    "phonon-2.5-en": "FermionResearch/Phonon-2.5-English",
+    "phonon-2.5": "FermionResearch/Phonon-2.5",
+    "phonon-2": "FermionResearch/Phonon-2",
+}
+
 DEFAULT_CONFIG = {
     "trigger_key": "ctrl+space",
     "push_to_talk": False,
@@ -22,7 +34,14 @@ DEFAULT_CONFIG = {
     "remove_fillers": True,      # drop "uh"/"um" the model writes inside sentences
     "save_history": True,        # persist dictated text to ~/.phonon2_history.json
     "engine_threads": None,      # speech-server CPU threads (None = server default)
-    "mic_index": None,
+    "speech_engine": "phonon",   # "phonon" or "whistle"; existing installs retain Phonon
+    "phonon_model": DEFAULT_PHONON_MODEL,
+    "live_typing": True,         # recognize previews while speech is in progress
+    "dictation_mode": "accurate",  # accurate: commit final phrases; fast: provisional words
+    "recognition_terms": [],     # optional Phonon recognition bias, separate from replacements
+    "show_preview": True,        # partial words preview; only complete phrases type by default
+    "strip_outer_quotes": True,  # remove quotation marks wrapping a whole dictated phrase
+    "mic_name": None,            # chosen microphone by name (None = system default)
     "port": 8010,
     "color_theme": "rainbow",    # "rainbow", "cyan_blue", "gold_fire", "emerald", "violet", "custom"
     "custom_hue": 195,           # 0 - 360
@@ -40,10 +59,41 @@ def load_config() -> dict:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return {**DEFAULT_CONFIG, **data}
+                if not isinstance(data, dict):
+                    raise ValueError("Configuration must be a JSON object")
+                config = {**DEFAULT_CONFIG, **data}
+                if "dictation_mode" not in data:
+                    # Older profiles typed partials directly, so their default
+                    # hidden preview would leave complete-phrase mode without
+                    # feedback. Apply once; explicit preferences in new profiles
+                    # remain authoritative on subsequent loads.
+                    config["show_preview"] = True
+                if not isinstance(config["phonon_model"], str) or config["phonon_model"] not in PHONON_MODELS:
+                    config["phonon_model"] = DEFAULT_PHONON_MODEL
+                if config.get("dictation_mode") not in ("accurate", "fast"):
+                    config["dictation_mode"] = "accurate"
+                config["recognition_terms"] = recognition_terms(config.get("recognition_terms"))
+                return config
         except Exception as e:
             logger.error(f"Error loading config, using defaults: {e}")
     return DEFAULT_CONFIG.copy()
+
+
+def recognition_terms(value):
+    """Normalize a bounded immutable request snapshot; tolerate old/bad profiles."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    result, seen = [], set()
+    for term in value:
+        if not isinstance(term, str):
+            continue
+        term = " ".join(term.split())[:80]
+        if term and term.casefold() not in seen:
+            result.append(term)
+            seen.add(term.casefold())
+        if len(result) == 25:
+            break
+    return result
 
 
 def save_config(cfg: dict):

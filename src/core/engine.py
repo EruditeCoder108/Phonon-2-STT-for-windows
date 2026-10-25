@@ -1,7 +1,7 @@
 """
-Phonon-2 Speech Engine Manager
+Phonon Speech Engine Manager
 
-Owns the local Phonon-2 server process (`phonon-2 serve`) and talks to it over HTTP:
+Owns the selected local Phonon server (`fermion serve MODEL`) and talks to it over HTTP:
 
   * Process hygiene — the server's stdout/stderr are DRAINED continuously. The server logs one
     stderr line per request; an unread pipe fills after ~4 KB (~60 requests) and then blocks the
@@ -15,7 +15,9 @@ Owns the local Phonon-2 server process (`phonon-2 serve`) and talks to it over H
 
 import ctypes
 import collections
+import http.client
 import io
+import importlib.metadata
 import json
 import logging
 import os
@@ -29,6 +31,8 @@ import wave
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from typing import Callable, Deque, List, Optional
+
+from src.config import DEFAULT_PHONON_MODEL, PHONON_MODELS, PHONON_MODEL_REPOS
 
 logger = logging.getLogger(__name__)
 server_log = logging.getLogger("PhononServer")
@@ -84,6 +88,13 @@ _JOB_KILL_ON_CLOSE = 0x2000
 _JOB_EXTENDED_LIMIT_INFO = 9
 
 
+def _close_job(job):
+    if job:
+        k32 = ctypes.windll.kernel32
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle(job)
+
+
 def _create_kill_on_close_job():
     """Returns a job handle (kept alive for the process lifetime) or None if unsupported."""
     try:
@@ -97,6 +108,7 @@ def _create_kill_on_close_job():
         info = _ExtendedLimit()
         info.BasicLimitInformation.LimitFlags = _JOB_KILL_ON_CLOSE
         if not k32.SetInformationJobObject(job, _JOB_EXTENDED_LIMIT_INFO, ctypes.byref(info), ctypes.sizeof(info)):
+            _close_job(job)
             return None
         return job
     except Exception as e:
@@ -105,7 +117,19 @@ def _create_kill_on_close_job():
 
 
 class PhononEngine:
-    def __init__(self, port: int = 8010, host: str = "127.0.0.1", threads: Optional[int] = None):
+    name = PHONON_MODELS[DEFAULT_PHONON_MODEL]
+    supports_live_stream = True
+
+    def open_live_stream(self, on_partial):
+        from src.core.live import PhononStream
+        return PhononStream(self, on_partial)
+    def __init__(self, port: int = 8010, host: str = "127.0.0.1", threads: Optional[int] = None,
+                 model: str = DEFAULT_PHONON_MODEL, hotwords=None):
+        if model not in PHONON_MODELS:
+            raise ValueError(f"Unsupported Phonon model: {model}")
+        self.model = model
+        self.set_hotwords(hotwords)
+        self.name = PHONON_MODELS[model]
         self.port = port
         self.host = host
         self.threads = threads
@@ -116,17 +140,32 @@ class PhononEngine:
         self._lock = threading.Lock()          # guards process handle only; never held while waiting
         self._start_lock = threading.Lock()    # serialises start/restart
         self._stopping = False
+        self._stop_event = threading.Event()
         self._job = None
         self._recent_server_output: Deque[str] = collections.deque(maxlen=60)
+        self._tls = threading.local()          # one keep-alive HTTP connection per calling thread
+        self._server_conflict = ""
+        self._health_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.on_state_change: Optional[Callable[[bool, str], None]] = None   # (ready, message)
 
     # ── Health ──
 
     def is_server_running(self) -> bool:
+        self._server_conflict = ""
         try:
             req = urllib.request.Request(f"{self.base_url}/health", method="GET")
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                return resp.status == 200
+            with self._health_opener.open(req, timeout=1.5) as resp:
+                if resp.status != 200:
+                    return False
+                data = json.loads(resp.read(65536))
+                actual = str(data.get("repo") or data.get("model", "")).casefold()
+                expected = {self.model, PHONON_MODEL_REPOS[self.model].casefold()}
+                if data.get("kind") != "speech" or actual not in expected:
+                    self._server_conflict = (
+                        f"Port {self.port} serves {data.get('model', 'an unknown service')}; "
+                        f"expected {self.name}. Close that server or choose another port.")
+                    return False
+                return True
         except Exception:
             return False
 
@@ -142,17 +181,9 @@ class PhononEngine:
     # ── Process management ──
 
     def _kill_stale_servers(self):
-        """Kill orphaned phonon-2.exe processes (e.g. from a previous hard crash)."""
-        try:
-            result = subprocess.run(
-                ["taskkill", "/f", "/im", "phonon-2.exe"],
-                capture_output=True, creationflags=CREATE_NO_WINDOW,
-            )
-            if result.returncode == 0:
-                logger.info("Killed stale phonon-2.exe process(es).")
-                time.sleep(1)
-        except Exception:
-            pass
+        """Clean up only this instance's child; never kill other apps' servers."""
+        if self._process is not None and self._owns_process:
+            self._terminate_process()
 
     @staticmethod
     def _drain(stream, tag: str, sink: Deque[str]):
@@ -172,15 +203,25 @@ class PhononEngine:
             pass
 
     def _spawn(self):
+        installed = importlib.metadata.version("fermion-research")
+        if tuple(int(n) for n in installed.split(".")[:3]) < (0, 2, 14):
+            raise RuntimeError("Phonon-2.5 needs fermion-research 0.2.14 or newer. "
+                               "Run .venv\\Scripts\\python.exe -m pip install -r requirements.txt")
         venv_bin_dir = os.path.dirname(sys.executable)
-        phonon_exe = os.path.join(venv_bin_dir, "phonon-2.exe")
-        if not os.path.exists(phonon_exe):
-            phonon_exe = os.path.join(venv_bin_dir, "fermion.exe")
-
-        cmd = [phonon_exe, "serve", "--port", str(self.port)]
+        python = os.path.join(venv_bin_dir, "python.exe")
+        if not os.path.exists(python):
+            raise RuntimeError("The virtual environment's Python is missing. Reinstall requirements.txt.")
+        # Avoid the fixed-model launcher and use console Python for captured
+        # output under pythonw startup. Windows venv Python can redirect to a
+        # child interpreter; the Job Object must cover and reap that child too.
+        cmd = [python, "-c", "from fermion.cli import main; main()", "serve", self.model,
+               "--host", self.host, "--port", str(self.port)]
         if self.threads:
             cmd += ["--threads", str(int(self.threads))]
-        logger.info(f"Starting Phonon-2 server: {' '.join(cmd)}")
+        logger.info("Starting %s server: %s", self.name, ' '.join(cmd))
+        env = os.environ.copy()
+        env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        env["DO_NOT_TRACK"] = "1"
 
         proc = subprocess.Popen(
             cmd,
@@ -188,6 +229,7 @@ class PhononEngine:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=CREATE_NO_WINDOW,
+            env=env,
         )
         for stream, tag in ((proc.stdout, "out"), (proc.stderr, "err")):
             threading.Thread(target=self._drain, args=(stream, tag, self._recent_server_output),
@@ -207,45 +249,71 @@ class PhononEngine:
     def start_server(self, wait_timeout: int = 120):
         """Starts (or adopts) the local server and blocks until /health is OK."""
         with self._start_lock:
-            self._stopping = False
+            if self._stop_event.is_set():
+                raise RuntimeError("Server start aborted (shutting down).")
             if self.is_server_running():
-                logger.info("A healthy Phonon-2 server is already running; adopting it.")
-                self._owns_process = False
+                logger.info("A healthy %s server is already running.", self.name)
                 self._set_ready(True, "adopted")
                 return
+            if self._server_conflict:
+                raise RuntimeError(self._server_conflict)
 
             self._kill_stale_servers()
+            if self._stop_event.is_set():
+                raise RuntimeError("Server start aborted (shutting down).")
             proc = self._spawn()
             with self._lock:
                 self._process = proc
                 self._owns_process = True
 
-            start_time = time.time()
-            while time.time() - start_time < wait_timeout:
-                if self._stopping:
-                    raise RuntimeError("Server start aborted (shutting down).")
-                if proc.poll() is not None:
-                    tail = " | ".join(list(self._recent_server_output)[-5:])
-                    raise RuntimeError(f"Phonon-2 server exited with code {proc.returncode}. Output: {tail[:500]}")
-                if self.is_server_running():
-                    logger.info("Phonon-2 server is ready and healthy.")
-                    self._set_ready(True, "ready")
-                    return
-                time.sleep(1.0)
-
-            raise TimeoutError(f"Phonon-2 server failed to start within {wait_timeout}s.")
+            try:
+                start_time = time.monotonic()
+                while time.monotonic() - start_time < wait_timeout:
+                    if self._stopping:
+                        raise RuntimeError("Server start aborted (shutting down).")
+                    if proc.poll() is not None:
+                        tail = " | ".join(list(self._recent_server_output)[-5:])
+                        raise RuntimeError(f"{self.name} server exited with code {proc.returncode}. Output: {tail[:500]}")
+                    if self.is_server_running():
+                        logger.info("%s server is ready and healthy.", self.name)
+                        self._set_ready(True, "ready")
+                        return
+                    if self._server_conflict:
+                        raise RuntimeError(self._server_conflict)
+                    self._stop_event.wait(1.0)
+                raise TimeoutError(f"{self.name} server failed to start within {wait_timeout}s.")
+            except Exception:
+                self._terminate_process()
+                raise
 
     def stop_server(self):
         """Terminates the server process if this instance started it."""
+        self.request_stop()
+        with self._start_lock:
+            self._terminate_process()
+            job, self._job = self._job, None
+            _close_job(job)
+
+    def request_stop(self):
+        """Prevent startup/restarts immediately, while queued transcription finishes."""
         self._stopping = True
+        self._stop_event.set()
+
+    def _terminate_process(self):
         with self._lock:
             proc, owned = self._process, self._owns_process
             self._process = None
+            self._owns_process = False
+            job = self._job if owned else None
+            if owned:
+                self._job = None
         self._is_ready = False
         if proc and owned:
-            logger.info("Stopping Phonon-2 server process...")
+            logger.info("Stopping %s server process tree...", self.name)
+            _close_job(job)  # includes Windows venv redirector children, on every restart
             try:
-                proc.terminate()
+                if proc.poll() is None:
+                    proc.terminate()
                 proc.wait(timeout=3)
             except Exception:
                 try:
@@ -260,21 +328,19 @@ class PhononEngine:
         def _loop():
             misses = 0
             while not self._stopping:
-                time.sleep(interval)
-                if self._stopping or not self._is_ready:
-                    misses = 0
-                    continue
-                if self.is_server_running():
+                if self._stop_event.wait(interval):
+                    break
+                if self._is_ready and self.is_server_running():
                     misses = 0
                     continue
                 misses += 1
                 proc = self._process
                 dead = proc is not None and proc.poll() is not None
-                if dead or misses >= failures_before_restart:
+                if dead or not self._is_ready or misses >= failures_before_restart:
                     logger.error("Speech server is down or unresponsive; restarting it.")
                     self._set_ready(False, "restarting")
                     try:
-                        self.stop_server()
+                        self._terminate_process()
                         self.start_server(wait_timeout=120)
                     except Exception as e:
                         logger.error(f"Server restart failed: {e}")
@@ -310,8 +376,24 @@ class PhononEngine:
             wf.writeframes(pcm_bytes)
         return buf.getvalue()
 
+    def _connection(self, fresh: bool = False) -> http.client.HTTPConnection:
+        """This thread's persistent keep-alive connection (each worker thread gets its own)."""
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None and fresh:
+            conn.close()
+            conn = None
+        if conn is None:
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=30)
+            self._tls.conn = conn
+        return conn
+
     def transcribe(self, pcm_bytes: bytes, sample_rate: int = 16000) -> TranscribeResult:
-        """Transcribes raw 16-bit mono PCM. Retries once on transport errors.
+        """Transcribes raw 16-bit mono PCM over a reused keep-alive connection.
+
+        Each calling thread keeps one HTTP/1.1 connection open, so a decode no longer pays a TCP
+        connect + teardown. A connection the server has dropped is replaced and the request
+        retried once. Thread-safe: concurrent callers use separate connections (the server
+        serialises the actual decodes).
 
         Returns TranscribeResult(error=True) on failure so callers can tell a failed request
         apart from a clip with no speech in it.
@@ -320,41 +402,52 @@ class PhononEngine:
             return TranscribeResult()
 
         boundary = "----PhononBoundary7f3a9c21"
+        fields = {"model": self.model, "response_format": "verbose_json", "timestamp_granularities": "word"}
+        terms = self.hotwords
+        if terms:
+            fields["hotwords"] = json.dumps(terms, ensure_ascii=False)
         body = self._build_multipart(
             self._pcm_to_wav(pcm_bytes, sample_rate),
-            {"response_format": "verbose_json", "timestamp_granularities": "word"},
+            fields,
             boundary,
         )
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
 
         last_err = ""
         for attempt in range(2):
-            req = urllib.request.Request(
-                f"{self.base_url}/v1/audio/transcriptions",
-                data=body,
-                headers={
-                    "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    "Content-Length": str(len(body)),
-                    "Connection": "close",
-                },
-                method="POST",
-            )
+            conn = self._connection(fresh=attempt > 0)
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode())
+                conn.request("POST", "/v1/audio/transcriptions", body=body, headers=headers)
+                resp = conn.getresponse()
+                payload = resp.read()
+                if resp.will_close:
+                    self._connection(fresh=True)      # server is closing it; open a new one next time
+                if resp.status != 200:
+                    last_err = f"HTTP {resp.status}: {payload.decode(errors='replace')[:200]}"
+                    break   # a 4xx/5xx answer is deterministic; retrying will not help
+                data = json.loads(payload.decode())
                 words = [
                     {"word": w.get("word", ""), "start": float(w.get("start", 0.0)), "end": float(w.get("end", 0.0))}
                     for w in data.get("words", []) or []
                 ]
                 return TranscribeResult(text=(data.get("text") or "").strip(), words=words)
-            except urllib.error.HTTPError as e:
-                last_err = f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"
-                break   # a 4xx/5xx answer is deterministic; retrying will not help
             except Exception as e:
-                last_err = str(e)
-                time.sleep(0.3)
+                # Typically a stale keep-alive socket (server restarted / idle-closed it).
+                last_err = str(e) or type(e).__name__
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._tls.conn = None
+                if attempt == 0:
+                    time.sleep(0.05)
 
         logger.error(f"Transcription failed: {last_err}")
         return TranscribeResult(error=True)
+
+    def set_hotwords(self, terms):
+        from src.config import recognition_terms
+        self.hotwords = tuple(recognition_terms(terms))
 
     def transcribe_wav_bytes(self, pcm_bytes: bytes, sample_rate: int = 16000) -> str:
         """Plain-text convenience wrapper (kept for scripts/tests)."""

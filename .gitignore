@@ -33,3 +33,7 @@ config.json
 
 # Logs
 *.log
+
+# Downloaded runtimes / audio used only for model research
+.model-research/
+.models/

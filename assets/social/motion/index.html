@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Syllink — launch film</title>
+<link rel="stylesheet" href="orb.css">
+<link rel="stylesheet" href="film.css">
+<script src="node_modules/motion/dist/motion.js"></script>
+</head>
+<body>
+<main id="stage" aria-label="Syllink offline Windows dictation launch film">
+  <div id="lightField"></div><div id="grain"></div>
+  <header id="brand"><span class="brand-dot"></span><span>SYLLINK</span></header>
+  <div id="edition">VOICE → TEXT</div>
+  <div id="orb-halo"></div><div id="orb-stage"><div id="orb-anchor"></div></div>
+
+  <section id="intro" class="scene">
+    <div class="eyebrow" id="intro-kicker">LESS BETWEEN YOU AND YOUR WORDS.</div>
+    <div class="line-mask intro-one"><h1 id="intro-one">Your voice.</h1></div>
+    <div class="line-mask intro-two"><h1 id="intro-two">Straight to text.</h1></div>
+    <div id="intro-note"><span class="small-line"></span>Offline dictation for Windows</div>
+  </section>
+
+  <section id="demo" class="scene">
+    <div class="eyebrow" id="demo-kicker">A SHORTCUT. A THOUGHT. YOUR WORDS.</div>
+    <h2 id="demo-title">Speak.<br><span>Keep your flow.</span></h2>
+    <div id="dictation-card">
+      <div class="card-top"><span>LIVE DICTATION</span><div id="meter"><i></i><i></i><i></i><i></i><i></i></div></div>
+      <div id="typed"><span id="typed-words"></span><span id="caret"></span></div>
+      <div class="card-bottom"><span>From a thought to a sentence.</span><span class="key">Ctrl</span><span class="plus">+</span><span class="key">Space</span></div>
+    </div>
+    <div id="demo-caption">An illustrative dictation sequence</div>
+  </section>
+
+  <section id="model" class="scene">
+    <div id="model-copy">
+      <div class="eyebrow" id="model-kicker">A NEW VOICE ENGINE, INSIDE SYLLINK.</div>
+      <div class="line-mask model-name-mask"><h2 id="model-name">Phonon</h2></div>
+      <div id="model-version"><span id="model-two">2</span><span id="model-dot">.</span><span id="model-five">5</span></div>
+      <div id="model-note">English by default.<br><span>Recognition runs on your PC.</span></div>
+    </div>
+  </section>
+
+  <section id="local" class="scene">
+    <div class="eyebrow" id="local-kicker">LOCAL BY DESIGN.</div>
+    <div class="line-mask local-one-mask"><h2 id="local-one">On your PC.</h2></div>
+    <div class="line-mask local-two-mask"><h2 id="local-two">On your terms.</h2></div>
+    <div id="local-notes"><span>No cloud transcription.</span><span class="separator"></span><span>No API key.</span></div>
+    <div id="local-foot">Offline after the first model download.</div>
+  </section>
+
+  <section id="close" class="scene">
+    <div id="close-brand">Syllink<span id="close-period">.</span></div>
+    <div id="close-line">Your voice. Straight to text.</div>
+    <div id="close-model">POWERED BY PHONON 2.5</div>
+    <div id="close-platform">OFFLINE DICTATION FOR WINDOWS</div>
+  </section>
+  <div id="timeline"><i></i></div>
+</main>
+<div id="preview-controls"><button id="play">Replay film</button><span>24 seconds · 1920 × 1080 · 60 fps</span></div>
+<script src="film.js"></script>
+</body>
+</html>

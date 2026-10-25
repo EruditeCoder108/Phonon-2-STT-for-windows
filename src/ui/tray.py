@@ -47,6 +47,7 @@ class SystemTray(QObject):
     orb_settings_requested = Signal()
     toggle_mode_requested = Signal()
     quit_requested = Signal()
+    recovery_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,7 +61,7 @@ class SystemTray(QObject):
             self.icon_pixmap = create_tray_icon_pixmap()
             self.tray_icon.setIcon(QIcon(self.icon_pixmap))
 
-        self.tray_icon.setToolTip("Phonon-2 System Dictation")
+        self.tray_icon.setToolTip("Rio Dictation")
 
         self.menu = QMenu()
         self.menu.setStyleSheet("""
@@ -100,7 +101,7 @@ class SystemTray(QObject):
         self.menu.clear()
 
         # Status item (disabled, informational)
-        self.status_action = QAction("Phonon-2 Ready", self.menu)
+        self.status_action = QAction("Loading Rio...", self.menu)
         self.status_action.setIcon(get_svg_icon("check", "#2ED573", 14))
         self.status_action.setEnabled(False)
         self.menu.addAction(self.status_action)
@@ -117,6 +118,10 @@ class SystemTray(QObject):
         self.dashboard_action.triggered.connect(self.settings_requested.emit)
         self.menu.addAction(self.dashboard_action)
 
+        self.recovery_action = QAction("Recent transcripts...", self.menu)
+        self.recovery_action.triggered.connect(self.recovery_requested.emit)
+        self.menu.addAction(self.recovery_action)
+
         self.mode_action = QAction("Mode: Push-to-Talk", self.menu)
         self.mode_action.setIcon(get_svg_icon("keyboard", "#8E8E98", 14))
         self.mode_action.triggered.connect(self.toggle_mode_requested.emit)
@@ -124,7 +129,7 @@ class SystemTray(QObject):
 
         self.menu.addSeparator()
 
-        self.quit_action = QAction("Quit Phonon-2", self.menu)
+        self.quit_action = QAction("Quit Rio", self.menu)
         self.quit_action.setIcon(get_svg_icon("power", "#E05252", 14))
         self.quit_action.triggered.connect(self.quit_requested.emit)
         self.menu.addAction(self.quit_action)

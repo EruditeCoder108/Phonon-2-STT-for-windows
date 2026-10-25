@@ -1,0 +1,13 @@
+{
+  "name": "syllink-launch-motion",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Deterministic Syllink launch film using Motion springs and the app's actual CSS/SVG orb.",
+  "scripts": {
+    "render": "node render.cjs",
+    "preview": "node serve.cjs"
+  },
+  "dependencies": {
+    "motion": "14.6.0"
+  }
+}

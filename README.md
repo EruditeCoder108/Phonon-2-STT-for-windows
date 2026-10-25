@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/icon.png" width="90" alt="Phonon-2 icon"/>
+  <img src="assets/icon.png" width="90" alt="Rio icon"/>
 </p>
 
-<h1 align="center">Phonon-2 STT for Windows</h1>
+<h1 align="center">Rio — Offline Dictation for Windows</h1>
 
 <p align="center">
   A local, offline, privacy-first speech-to-text dictation app for Windows.<br/>
@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-blue?logo=windows" />
   <img src="https://img.shields.io/badge/python-3.14-blue?logo=python" />
-  <img src="https://img.shields.io/badge/engine-Phonon--2%20%28Fermion%29-purple" />
+  <img src="https://img.shields.io/badge/engine-Phonon--2.5%20English-purple" />
   <img src="https://img.shields.io/badge/ui-PySide6%20%2B%20WebEngine-green" />
   <img src="https://img.shields.io/badge/license-MIT-orange" />
 </p>
@@ -21,7 +21,11 @@
 
 ## What it is
 
-Phonon-2 STT is a Windows dictation tool that runs **entirely on your machine** — no internet required, no API keys, no data sent anywhere. You press a hotkey, speak, and your words appear at the cursor in whatever app you have focused.
+Rio is a Windows dictation tool that runs **entirely on your machine** after the first model download, with no API key and no audio upload. You press a hotkey, speak, and your words appear at the cursor in the focused app.
+
+**The default is now Phonon-2.5 English**, on the pinned `fermion-research==0.2.14` runtime. Settings → Audio & Voice also offers Phonon-2.5 (25 languages), the previous Phonon-2 model, and Whistle. The multilingual model does **not** support Hindi. See the [migration, measurements, and product audit](docs/product-audit-2026-10-24.md).
+
+To upgrade an existing checkout, run `.venv\Scripts\python.exe -m pip install -r requirements.txt`, then restart the app. Existing Phonon profiles automatically select 2.5 English when no explicit model preference exists; microphone, hotkeys, vocabulary and history preferences are retained. Existing Whistle users keep Whistle.
 
 The front-end is a floating animated orb HUD that sits in the corner of your screen. It pulses and reacts to your voice in real time, changes color as it cycles through themes, and stays completely out of the way of your keyboard focus.
 
@@ -53,7 +57,9 @@ TextInjector  ──── Unicode SendInput (clipboard untouched); paste only f
 Whatever app has keyboard focus
 ```
 
-The local speech server (`phonon-2.exe` / `fermion`) is started automatically when the app launches and is killed when the app closes.
+The app starts the equivalent of `fermion serve phonon-2.5-en --host 127.0.0.1 --port 8010` automatically. It checks the resident model identity before declaring readiness, and shuts down the owned server process tree on close or restart. An unrelated server occupying the port is reported and left running.
+
+**Dictation quality:** Complete phrases is now the default: partial recognition appears as a preview, and final phrases are typed after a pause. Bounded, paced recognition requests replace the old accumulating live stream. Settings → Audio & Voice also offers Fast live words, which can need revision review, and optional recognition terms for Phonon. Tray → Recent transcripts keeps the last 20 finals in memory for recovery, independently of saved history. See the [quality fixes and retest](docs/dictation-quality-2026-10-25.md).
 
 ---
 
@@ -68,7 +74,7 @@ The local speech server (`phonon-2.exe` / `fermion`) is started automatically wh
 - **`src/core/vad.py`** / **`src/core/segmenter.py`** — Silero VAD (ONNX, one CPU thread, no torch in the UI process) and the state machine that cuts the stream into speech-only utterances with pre-roll and measured evidence. Falls back to a weaker energy VAD if `silero-vad`/`onnxruntime` are missing.
 - **`src/core/filters.py`** — Decides whether a decoded utterance is real speech, using the VAD/SNR evidence measured on the voiced frames only.
 - **`src/core/pipeline.py`** — Turns utterances into correctly punctuated text: phrase stitching and deferred sentence-final punctuation.
-- **`src/core/engine.py`** — Starts and supervises the local `phonon-2` server (output drained, Job Object so it dies with the app, health watchdog with auto-restart) and provides `transcribe()` returning text + word timestamps.
+- **`src/core/engine.py`** — Starts and supervises the explicitly selected Phonon model (output drained, model identity checked, Job Object covering descendants, health watchdog with auto-restart) and provides `transcribe()` returning text + word timestamps.
 - **`src/core/injector.py`** — Win32 `SendInput` Unicode typing (emoji-safe, clipboard untouched), clipboard paste fallback for very long text, and detection of elevated target windows that Windows would silently block.
 - **`src/core/hotkey.py`** — Global keyboard hook for `Ctrl+Space` (or any configurable combo). Non-blocking, runs in a background thread.
 - **`src/core/vocabulary.py`** — Simple phrase replacement engine (e.g. "my email" → actual address).
@@ -82,9 +88,9 @@ The local speech server (`phonon-2.exe` / `fermion`) is started automatically wh
 - Windows 10 or 11 (64-bit)
 - Python 3.14
 - A working microphone
-- **RAM**: Recommended 8 GB total system RAM (Phonon-2 itself uses **~1.4 GB** for the speech model weights + **~200 MB** for the UI, total ~1.6 GB).
+- **RAM**: Recommended 8 GB total system RAM. In the October 24 local fixture check, the 2.5 English server and its descendants used about **908 MiB** of working-set memory, excluding the UI. The roughly 178 MB unpacked model size is not the total runtime memory requirement; usage varies with machine and workload.
 
-The `phonon-2` / `fermion` speech engine binary is installed as a Python package (`fermion-research`) and runs as a local HTTP server. The model weights are downloaded on first run.
+The speech engine is installed as the Python package `fermion-research` and runs as a local HTTP/WebSocket server. The default English model is a roughly 158 MB first download; the multilingual model is roughly 156 MB. Each unpacks to about 178 MB. The runtime verifies pinned model checksums.
 
 ---
 
@@ -108,7 +114,7 @@ pythonw run.py
 
 > `pythonw` instead of `python` keeps the terminal window hidden. Use `python run.py` if you want to see log output.
 
-On first launch the speech model will be downloaded (this takes a minute). After that it's instant.
+First launch requires internet access to download the selected model. Later launches use the cache and still need a few seconds to load the engine. Cached offline startup was tested; download time depends on the connection.
 
 ---
 
@@ -167,11 +173,13 @@ Tunables (Dashboard → Audio): pause length that ends a phrase (500–1400 ms),
 
 ## Known limitations
 
+Windows reliability work is documented in [Phase one](docs/phase-one.md). [Phase two](docs/phase-two.md) adds Whistle selection and automatic USB microphone recovery. [Live dictation](docs/live-typing.md) adds typing during speech, optional previews and quote cleanup. Choose the model in **Settings → Audio & Voice → Speech Engine**; Whistle installs its verified model and runtime on first use. Phonon-2.5 English is the default. The model comparison is in [Model research](docs/model-research.md).
+
 - **Windows only.** Uses Win32 APIs (`SendInput`, clipboard), WASAPI audio, PySide6 WebEngine.
-- **Elevated windows.** Windows blocks injected input into windows running as administrator unless Phonon-2 is also elevated; the app shows a notice instead of failing silently.
-- **English only**, and no vocabulary biasing inside the model on CPU yet — custom vocabulary is applied as text replacement after transcription.
+- **Elevated windows.** Windows blocks injected input into windows running as administrator unless Rio is also elevated; the app shows a notice instead of failing silently.
+- **Languages:** English by default; the optional Phonon-2.5 model detects 25 languages automatically. Hindi is not included. The app's filler rules remain English-focused. The runtime now supports recognition hotwords on CPU, but this app's vocabulary UI still applies replacements after transcription.
 - **Dictation history** is stored in plain text at `~/.phonon2_history.json`; turn it off in Dashboard → Audio if you dictate sensitive text.
-- **Requires a capable CPU/GPU.** The local speech model loads into system memory. Tested on modern Intel/AMD processors with fast local inference.
+- **CPU inference.** A GPU is not required. The runtime selects a kernel supported by the processor; speed depends on the exact machine.
 
 ---
 
@@ -181,7 +189,7 @@ Tunables (Dashboard → Audio): pause length that ends a phrase (500–1400 ms),
 |---|---|
 | UI framework | PySide6 (Qt 6) |
 | Orb animation | CSS/SVG via QWebEngineView (Uiverse.io base by andrew-manzyk) |
-| Speech engine | fermion-research (`phonon-2`) |
+| Speech engine | fermion-research 0.2.14 (`phonon-2.5-en` by default) |
 | Deep learning runtime | PyTorch |
 | Audio capture | sounddevice (PortAudio) |
 | Voice activity detection | Silero VAD via onnxruntime |
@@ -233,8 +241,8 @@ Tunables (Dashboard → Audio): pause length that ends a phrase (500–1400 ms),
 
 ## License
 
-MIT — do whatever you want with it.
+The app's stated license is MIT. Model weights and dependencies have their own licenses: Phonon-2.5 and Phonon-2.5 English are by Fermion Research, released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See their [multilingual model](https://www.fermionresearch.com/models/phonon-2-5/) and [English model](https://www.fermionresearch.com/models/phonon-2-5-english/) pages. This app changes the integration, not the downloaded weights.
 
 ---
 
-<p align="center">Built with Python, PySide6, and a local speech model that never phones home.</p>
+<p align="center">Built with Python, PySide6, and local speech engines. Whistle runs with the documented telemetry opt-outs; first-use model downloads need internet access.</p>

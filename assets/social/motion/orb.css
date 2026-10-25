@@ -1,0 +1,96 @@
+/* Extracted from src/ui/hud.py. Original orb: Uiverse / andrew-manzyk. */
+.loader {
+  --time-animation: 2s;
+  --size: 0.70;
+  position: relative;
+  border-radius: 50%;
+  transform: scale(var(--size));
+  box-shadow:
+    0 0 25px 0 #ffbf4880,
+    0 20px 50px 0 #bf4a1d80;
+}
+
+.loader::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100px;
+  height: 100px;
+  border-radius: 50%;
+  border-top: solid 1.5px #ffbf48;
+  border-bottom: solid 1.5px #be4a1d;
+  background: linear-gradient(180deg, #ffbf4740, #bf4a1d80);
+  box-shadow:
+    inset 0 10px 10px 0 #ffbf4780,
+    inset 0 -10px 10px 0 #bf4a1d80;
+}
+
+.loader .box {
+  width: 100px;
+  height: 100px;
+  background: linear-gradient(180deg, #ffbf48 30%, #be4a1d 70%);
+  mask: url(#clipping);
+  -webkit-mask: url(#clipping);
+}
+
+/* Calm solid glow mode — remove liquid mask, keep circle shape */
+.loader.no-liquid .box {
+  mask: none !important;
+  -webkit-mask: none !important;
+  border-radius: 50%;
+}
+
+.loader svg {
+  position: absolute;
+}
+.loader svg #clipping {
+  filter: contrast(15);
+  animation: roundness calc(var(--time-animation) / 2) linear infinite;
+}
+.loader svg #clipping polygon {
+  filter: blur(7px);
+}
+.loader svg #clipping polygon:nth-child(1) {
+  transform-origin: 75% 25%;
+  transform: rotate(90deg);
+}
+.loader svg #clipping polygon:nth-child(2) {
+  transform-origin: 50% 50%;
+  animation: rotation var(--time-animation) linear infinite reverse;
+}
+.loader svg #clipping polygon:nth-child(3) {
+  transform-origin: 50% 60%;
+  animation: rotation var(--time-animation) linear infinite;
+  animation-delay: calc(var(--time-animation) / -3);
+}
+.loader svg #clipping polygon:nth-child(4) {
+  transform-origin: 40% 40%;
+  animation: rotation var(--time-animation) linear infinite reverse;
+}
+.loader svg #clipping polygon:nth-child(5) {
+  transform-origin: 40% 40%;
+  animation: rotation var(--time-animation) linear infinite reverse;
+  animation-delay: calc(var(--time-animation) / -2);
+}
+.loader svg #clipping polygon:nth-child(6) {
+  transform-origin: 60% 40%;
+  animation: rotation var(--time-animation) linear infinite;
+}
+.loader svg #clipping polygon:nth-child(7) {
+  transform-origin: 60% 40%;
+  animation: rotation var(--time-animation) linear infinite;
+  animation-delay: calc(var(--time-animation) / -1.5);
+}
+
+@keyframes rotation {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+@keyframes roundness {
+  0%,  60%, 100% { filter: contrast(15); }
+  20%, 40%       { filter: contrast(3);  }
+}
+
+
+.loader { --size: 1; filter: hue-rotate(157deg); }

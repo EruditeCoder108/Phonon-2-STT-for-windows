@@ -44,6 +44,8 @@ user32.SetClipboardData.restype = ctypes.c_void_p
 user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
 user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
 user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.EnumClipboardFormats.restype = wintypes.UINT
+user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
 
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
@@ -128,8 +130,8 @@ def set_clipboard_text(text: str) -> bool:
     if not user32.OpenClipboard(None):
         return False
     try:
-        user32.EmptyClipboard()
-        byte_len = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+        encoded = text.encode("utf-16-le") + b"\x00\x00"
+        byte_len = len(encoded)  # emoji occupy two UTF-16 code units on Windows
         h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, byte_len)
         if not h_mem:
             return False
@@ -140,11 +142,12 @@ def set_clipboard_text(text: str) -> bool:
             return False
 
         try:
-            ctypes.memmove(ptr, ctypes.c_wchar_p(text), byte_len)
+            ctypes.memmove(ptr, encoded, byte_len)
         finally:
             kernel32.GlobalUnlock(h_mem)
 
-        if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+        # Allocation/locking can fail; preserve the old clipboard until ready.
+        if not user32.EmptyClipboard() or not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
             kernel32.GlobalFree(h_mem)
             return False
         return True
@@ -165,7 +168,7 @@ def _simulate_ctrl_v():
     inputs[2].u.ki = KEYBDINPUT(VK_V, 0, KEYEVENTF_KEYUP, 0, 0)
     inputs[3].type = INPUT_KEYBOARD
     inputs[3].u.ki = KEYBDINPUT(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0, 0)
-    user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+    return user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(INPUT)) == 4
 
 
 # ── Injection strategies ──
@@ -180,10 +183,21 @@ AUTO_PASTE_THRESHOLD_CHARS = 600
 
 
 def _clipboard_has_non_text() -> bool:
-    return any(user32.IsClipboardFormatAvailable(f) for f in (_CF_BITMAP, _CF_DIB, _CF_HDROP))
+    # HTML/RTF and app-specific formats are just as valuable as images/files.
+    # Only use text-only save/restore when every current format is plain text.
+    if not user32.OpenClipboard(None):
+        return True
+    try:
+        current = 0
+        while current := user32.EnumClipboardFormats(current):
+            if current not in {1, 7, CF_UNICODETEXT, 16}:  # ANSI, OEM, Unicode, locale
+                return True
+        return False
+    finally:
+        user32.CloseClipboard()
 
 
-def type_via_clipboard(text: str, restore_delay_sec: float = 0.15) -> bool:
+def type_via_clipboard(text: str, restore_delay_sec: float = 0.15, expected_hwnd: int | None = None) -> bool:
     """
     Pastes text via the clipboard, restoring the previous text afterwards.
     Returns False (without touching anything) if the clipboard holds an image or files,
@@ -191,6 +205,8 @@ def type_via_clipboard(text: str, restore_delay_sec: float = 0.15) -> bool:
     """
     if not text:
         return True
+    if expected_hwnd is not None and get_foreground_hwnd() != expected_hwnd:
+        return False
     if _clipboard_has_non_text():
         return False
 
@@ -198,17 +214,20 @@ def type_via_clipboard(text: str, restore_delay_sec: float = 0.15) -> bool:
     if not set_clipboard_text(text):
         return False
 
-    _simulate_ctrl_v()
-    time.sleep(restore_delay_sec)
-
-    # Only restore if nobody replaced the clipboard in the meantime.
-    if get_clipboard_text() == text:
-        if original_text is not None:
-            set_clipboard_text(original_text)
-        elif user32.OpenClipboard(None):
-            user32.EmptyClipboard()
-            user32.CloseClipboard()
-    return True
+    sent = False
+    try:
+        sent = (expected_hwnd is None or get_foreground_hwnd() == expected_hwnd) and _simulate_ctrl_v()
+        if sent:
+            time.sleep(restore_delay_sec)
+    finally:
+        # Restore even if input fails, but never overwrite a newer clipboard value.
+        if get_clipboard_text() == text:
+            if original_text is not None:
+                set_clipboard_text(original_text)
+            elif user32.OpenClipboard(None):
+                user32.EmptyClipboard()
+                user32.CloseClipboard()
+    return bool(sent)
 
 
 def _text_to_key_events(text: str) -> list:
@@ -232,7 +251,7 @@ def _text_to_key_events(text: str) -> list:
     return events
 
 
-def type_unicode_chars(text: str) -> bool:
+def type_unicode_chars(text: str, expected_hwnd: int | None = None) -> bool:
     """
     Types text with KEYEVENTF_UNICODE events. Returns False if Windows rejected the input
     (typically because the target window is elevated and we are not — UIPI).
@@ -243,6 +262,8 @@ def type_unicode_chars(text: str) -> bool:
     events = _text_to_key_events(text)
     step = _SENDINPUT_BATCH_CHARS * 2
     for i in range(0, len(events), step):
+        if expected_hwnd is not None and get_foreground_hwnd() != expected_hwnd:
+            return False
         batch = events[i:i + step]
         arr = (INPUT * len(batch))()
         for j, (vk, scan, flags) in enumerate(batch):
@@ -310,7 +331,7 @@ def foreground_blocks_injection() -> bool:
         return False
 
 
-def inject_text(text: str, mode: str = "auto") -> bool:
+def inject_text(text: str, mode: str = "auto", expected_hwnd: int | None = None) -> bool:
     """
     Main entry point for text injection into the focused control.
 
@@ -322,12 +343,14 @@ def inject_text(text: str, mode: str = "auto") -> bool:
     if not text:
         return True
 
+    if expected_hwnd is not None and (not expected_hwnd or get_foreground_hwnd() != expected_hwnd):
+        return False
     if foreground_blocks_injection():
         logger.warning("Foreground window is elevated; Windows blocks injected text into it. "
-                       "Run Phonon-2 as administrator to dictate there.")
+                       "Run Rio as administrator to dictate there.")
         return False
 
     want_paste = mode == "paste" or (mode == "auto" and len(text) > AUTO_PASTE_THRESHOLD_CHARS)
-    if want_paste and type_via_clipboard(text):
+    if want_paste and type_via_clipboard(text, expected_hwnd=expected_hwnd):
         return True
-    return type_unicode_chars(text)
+    return type_unicode_chars(text, expected_hwnd=expected_hwnd)

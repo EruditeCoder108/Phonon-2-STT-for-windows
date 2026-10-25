@@ -31,7 +31,7 @@ def main():
     utts: "queue.Queue" = queue.Queue()
     activity = {"on": False}
     audio = AudioCaptureEngine(
-        device_index=cfg.get("mic_index"),
+        device_name=cfg.get("mic_name"),
         on_utterance=utts.put,
         on_activity=lambda a: activity.__setitem__("on", a),
         pause_ms=cfg.get("pause_ms", 700),

@@ -1,4 +1,4 @@
-fermion-research>=0.2.7
+fermion-research==0.2.14
 torch>=2.14.0
 safetensors>=0.8.0
 soundfile>=0.14.0
@@ -11,3 +11,4 @@ transformers>=5.18.0
 numpy>=2.5.0
 silero-vad>=6.0
 onnxruntime>=1.20
+websockets>=15,<18

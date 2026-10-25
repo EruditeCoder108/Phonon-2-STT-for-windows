@@ -1,5 +1,5 @@
 """
-Entrypoint to run the Phonon-2 Windows Dictation App
+Entrypoint to run Rio, the Windows Dictation App
 """
 import sys
 import os

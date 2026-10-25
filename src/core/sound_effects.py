@@ -26,6 +26,7 @@ import threading
 from typing import Dict, List, Optional
 
 import numpy as np
+from src.core import devices
 import sounddevice as sd
 
 logger = logging.getLogger(__name__)
@@ -292,21 +293,27 @@ class SoundEffects:
             return
         data = self._bank_for(theme or self.theme)[cue]
         gain = (self.volume / 100.0) ** 1.6
-        if not self._ensure_stream():
-            try:
-                sd.play(data * gain, samplerate=self._rate, blocking=False)    # last-resort fallback
-            except Exception as e:
-                logger.debug(f"Audio cue playback error: {e}")
-            return
-        with self._lock:
-            self._voices.append([data, 0, gain])
+        if not devices.stream_lock.acquire(blocking=False):
+            return  # a device refresh must not freeze the UI to play a chime
+        try:
+            if not self._ensure_stream():
+                return
+            with self._lock:
+                self._voices.append([data, 0, gain])
+        finally:
+            devices.stream_lock.release()
 
     # stream
 
     def _ensure_stream(self) -> bool:
+        with devices.stream_lock:
+            return self._ensure_stream_locked()
+
+    def _ensure_stream_locked(self) -> bool:
         if self._stream is not None and self._stream.active:
             return True
         self.close()
+        self._device, self._rate, self._extra = _pick_output()
         try:
             self._stream = sd.OutputStream(
                 samplerate=self._rate, channels=2, dtype="float32", device=self._device,
@@ -333,6 +340,10 @@ class SoundEffects:
         np.clip(outdata, -1.0, 1.0, out=outdata)
 
     def close(self):
+        with devices.stream_lock:
+            self._close_locked()
+
+    def _close_locked(self):
         stream, self._stream = self._stream, None
         with self._lock:
             self._voices = []

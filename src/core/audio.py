@@ -11,8 +11,10 @@ import numpy as np
 import sounddevice as sd
 import threading
 import logging
+import time
 from typing import Callable, Optional, List, Dict
 
+from src.core import devices
 from src.core.segmenter import UtteranceSegmenter, Utterance
 from src.core.vad import create_vad, FRAME_SAMPLES
 
@@ -27,75 +29,122 @@ BLOCK_SIZE = FRAME_SAMPLES   # one VAD frame (32 ms) per callback
 class AudioCaptureEngine:
     def __init__(
         self,
-        device_index: Optional[int] = None,
+        device_name: Optional[str] = None,
         on_utterance: Optional[Callable[[Utterance], None]] = None,
         on_level_update: Optional[Callable[[float], None]] = None,
         on_activity: Optional[Callable[[bool], None]] = None,
+        on_speculative: Optional[Callable[[Utterance, int], None]] = None,
+        on_cancel_speculative: Optional[Callable[[int], None]] = None,
         pause_ms: int = 700,
         voice_gate: bool = True,
+        on_live: Optional[Callable[[Utterance], None]] = None,
+        live_enabled: bool = False,
+        commit_partials: bool = True,
     ):
-        self.device_index = device_index
+        self.device_name = device_name
+        self.active_device: Optional[str] = None     # what actually opened (for the UI / logs)
+        self.fallback_reason = ""
+        self._last_callback = 0.0
+        self._stream_generation = 0
         self.on_level_update = on_level_update
 
         self._stream: Optional[sd.RawInputStream] = None
         self._is_recording = False
         self._is_stream_open = False
+        self._closed = False
         self._lock = threading.Lock()
+        self._open_lock = threading.RLock()      # serialises open/close/reopen of the mic stream
         self._segmenter = UtteranceSegmenter(
             create_vad(),
             on_utterance=lambda u: on_utterance(u) if on_utterance else None,
             on_activity=on_activity,
+            on_speculative=on_speculative,
+            on_cancel_speculative=on_cancel_speculative,
             pause_ms=pause_ms,
             voice_gate=voice_gate,
+            on_live=on_live,
+            live_enabled=live_enabled,
+            commit_partials=commit_partials,
         )
 
         self._ambient_noise = 60.0   # level-meter noise floor (orb animation only)
+        devices.add_stream_closer(self._release_for_refresh)
 
-    @staticmethod
-    def list_input_devices() -> List[Dict]:
-        """Lists all available audio input devices."""
-        devices = []
+    @property
+    def needs_recovery(self):
+        if self._closed:
+            return False
         try:
-            for idx, dev in enumerate(sd.query_devices()):
-                if dev.get("max_input_channels", 0) > 0:
-                    devices.append({
-                        "index": idx,
-                        "name": dev["name"],
-                        "hostapi": dev["hostapi"],
-                        "channels": dev["max_input_channels"],
-                    })
-        except Exception as e:
-            logger.error(f"Error querying audio devices: {e}")
-        return devices
+            return (not self._is_stream_open or self._stream is None or not self._stream.active
+                    or time.monotonic() - self._last_callback > 3.0)
+        except Exception:
+            return True
 
-    def set_device(self, device_index: Optional[int]):
-        """Switches the input device."""
-        self.device_index = device_index
-        self._segmenter.forget_voice_level()     # a different mic has a different loudness scale
-        if self._is_stream_open:
-            self.close_stream()
-            self.warm_up()
+    def _release_for_refresh(self):
+        with devices.stream_lock, self._open_lock:
+            self._close_stream_locked()
+
+    def set_device(self, device_name: Optional[str]):
+        """Switches the input device (None = system default) and re-scans the device list."""
+        with devices.stream_lock, self._open_lock:
+            if self._closed:
+                return
+            self.device_name = device_name
+            self.reopen()
+
+    def reopen(self):
+        """Closes the mic, re-scans hardware (picks up newly plugged-in mics) and reopens it."""
+        with devices.stream_lock, self._open_lock:
+            if self._closed:
+                return
+            self._close_stream_locked()
+            devices.refresh()
+            # Also retry an input that failed at startup or after an unplug.
+            self._warm_up_locked()
 
     def set_pause_ms(self, pause_ms: int):
-        self._segmenter.set_pause_ms(pause_ms)
+        with self._lock:
+            self._segmenter.set_pause_ms(pause_ms)
 
     def set_voice_gate(self, enabled: bool):
-        self._segmenter.voice_gate = enabled
+        with self._lock:
+            self._segmenter.voice_gate = enabled
+
+    def set_live_enabled(self, enabled: bool):
+        with self._lock:
+            self._segmenter.live_enabled = enabled
+
+    def set_commit_partials(self, enabled: bool):
+        with self._lock:
+            self._segmenter.commit_partials = enabled
 
     @property
     def voice_level(self) -> Optional[float]:
         return self._segmenter.voice_level
 
     def warm_up(self):
-        """Opens the mic stream and keeps it running (hot mic)."""
+        """Opens the mic stream and keeps it running (hot mic). Can take ~2 s on some mic-array drivers."""
+        with devices.stream_lock, self._open_lock:
+            self._warm_up_locked()
+
+    def _warm_up_locked(self):
+        if self._closed:
+            raise RuntimeError("Microphone capture is closed.")
         if self._is_stream_open:
             return
 
-        def _callback(indata, frames, time_info, status):
+        def _callback(indata, frames, time_info, status, channel_count, stream_generation):
+            if stream_generation != self._stream_generation or self._closed:
+                return
+            self._last_callback = time.monotonic()
             if status:
                 logger.debug(f"Audio status warning: {status}")
 
             raw_bytes = bytes(indata)
+            if channel_count == 2:
+                # Stereo-only USB interfaces need both capture channels opened.
+                samples = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, 2)
+                raw_bytes = samples.astype(np.float32).mean(axis=1).astype(np.int16).tobytes()
 
             # Orb level meter: energy above an adaptive ambient floor, power-law shaped
             audio_array = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
@@ -112,52 +161,104 @@ class AudioCaptureEngine:
                 return
             try:
                 with self._lock:
-                    if self._is_recording:
+                    if self._is_recording and stream_generation == self._stream_generation:
                         self._segmenter.feed(raw_bytes)
             except Exception as e:
                 logger.error(f"Segmenter error: {e}", exc_info=True)
 
-        try:
-            self._stream = sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype=DTYPE,
-                blocksize=BLOCK_SIZE,
-                device=self.device_index,
-                callback=_callback,
-            )
-            self._stream.start()
-            self._is_stream_open = True
-            logger.info("Microphone stream opened (hot mic ready).")
-        except Exception as e:
-            logger.error(f"Failed to open audio stream: {e}", exc_info=True)
-            raise
+        last_error = RuntimeError("No microphone is available. Connect one and press Refresh.")
+        candidates = devices.input_candidates(self.device_name)
+        formats = []
+        for index, extra in candidates:
+            try:
+                if sd.query_devices(index, "input").get("max_input_channels", 1) >= 2:
+                    # Some USB interfaces accept mono but then expose only their
+                    # first (unused) jack. Prefer both channels before mono.
+                    formats.append((index, extra, 2))
+            except Exception:
+                pass
+            formats.append((index, extra, 1))
+        for index, extra, capture_channels in formats:
+            stream = None
+            try:
+                self._stream_generation += 1
+                generation = self._stream_generation
+                stream = sd.RawInputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=capture_channels,
+                    dtype=DTYPE,
+                    blocksize=BLOCK_SIZE,
+                    device=index,
+                    extra_settings=extra,
+                    callback=lambda data, frames, info, status, channels=capture_channels, gen=generation:
+                        _callback(data, frames, info, status, channels, gen),
+                )
+                stream.start()
+                active_name = sd.query_devices(index, "input")["name"]
+                self._stream = stream
+                self._is_stream_open = True
+                self.active_device = active_name
+                self._last_callback = time.monotonic()
+                self.fallback_reason = ""
+                if self.device_name and not (active_name.casefold() == self.device_name.casefold()
+                                              or self.device_name.casefold().startswith(active_name.casefold())):
+                    self.fallback_reason = f"{self.device_name} is unavailable; using {active_name}."
+                    logger.warning(self.fallback_reason)
+                with self._lock:
+                    self._segmenter.forget_voice_level()
+                self._ambient_noise = 60.0
+                logger.info(f"Microphone stream opened (hot mic ready): {self.active_device}")
+                return
+            except Exception as e:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                last_error = e
+                logger.debug(f"Input candidate {index} failed: {e}")
+        logger.error(f"Failed to open any audio input: {last_error}")
+        raise last_error
 
     def close_stream(self):
         """Closes the mic stream entirely (app shutdown)."""
-        self._is_recording = False
+        with devices.stream_lock, self._open_lock:
+            self._closed = True
+            self._close_stream_locked()
+            devices.remove_stream_closer(self._release_for_refresh)
+
+    def _close_stream_locked(self):
+        self._stream_generation += 1
+        with self._lock:
+            self._is_recording = False
         if self._stream:
             try:
                 self._stream.stop()
-                self._stream.close()
             except Exception as e:
                 logger.error(f"Error closing audio stream: {e}")
+            try:
+                self._stream.close()
+            except Exception:
+                logger.debug("Audio stream close failed", exc_info=True)
             self._stream = None
         self._is_stream_open = False
+        self.active_device = None
+        self.fallback_reason = ""
         if self.on_level_update:
             self.on_level_update(0.0)
 
     def start(self):
         """Begin segmenting speech for a dictation session."""
-        if self._is_recording:
-            return
-
-        if not self._is_stream_open:
-            self.warm_up()
-
-        with self._lock:
-            self._segmenter.reset()
-            self._is_recording = True
+        with devices.stream_lock, self._open_lock:
+            if self._closed:
+                raise RuntimeError("Microphone capture is closed.")
+            if self._is_recording:
+                return
+            if not self._is_stream_open:
+                self._warm_up_locked()
+            with self._lock:
+                self._segmenter.reset()
+                self._is_recording = True
         logger.info("Speech recording started.")
 
     def stop(self):

@@ -47,6 +47,10 @@ class Utterance:
     noise_floor: float      # ambient RMS estimate when this utterance was cut
     forced: bool = False    # True when cut by max length or session end, not by a natural pause
     level_ratio: Optional[float] = None   # speech_rms / learned voice level (None = not known / gate off)
+    spec_id: Optional[int] = None         # matching speculative decode ID (if pre-decoded)
+    target_hwnd: Optional[int] = None     # foreground window when speech began (None for standalone tools)
+    target_focus: Optional[tuple] = None  # native focused control when speech began
+    utterance_id: Optional[int] = None    # monotonic ID shared by live snapshots and their final phrase
 
     @property
     def duration_s(self) -> float:
@@ -62,7 +66,10 @@ class UtteranceSegmenter:
         vad,
         on_utterance: Callable[[Utterance], None],
         on_activity: Optional[Callable[[bool], None]] = None,
+        on_speculative: Optional[Callable[[Utterance, int], None]] = None,
+        on_cancel_speculative: Optional[Callable[[int], None]] = None,
         pause_ms: int = 700,
+        speculative_delay_ms: int = 280,
         min_speech_s: float = 0.15,
         preroll_s: float = 0.30,
         tail_keep_s: float = 0.25,
@@ -71,12 +78,21 @@ class UtteranceSegmenter:
         end_threshold: float = 0.35,
         start_frames: int = 3,
         voice_gate: bool = True,
+        on_live: Optional[Callable[[Utterance], None]] = None,
+        live_enabled: bool = False,
+        commit_partials: bool = True,
         start_rel: float = 0.28,
         cont_rel: float = 0.30,
     ):
         self.vad = vad
         self.on_utterance = on_utterance
         self.on_activity = on_activity
+        self.on_speculative = on_speculative
+        self.on_live = on_live
+        self.live_enabled = live_enabled
+        self.commit_partials = commit_partials
+        self._utterance_seq = 0
+        self.on_cancel_speculative = on_cancel_speculative
         self.min_speech_s = min_speech_s
         self.start_threshold = start_threshold
         self.end_threshold = end_threshold
@@ -91,11 +107,14 @@ class UtteranceSegmenter:
         self._level_time = 0.0
         self._preroll_frames = max(1, round(preroll_s / FRAME_S))
         self._tail_keep_frames = max(1, round(tail_keep_s / FRAME_S))
+        self._spec_frames = max(self._tail_keep_frames, round(speculative_delay_ms / 1000.0 / FRAME_S))
         self._max_frames = round(max_utterance_s / FRAME_S)
         self._decay_frames = round(0.13 / FRAME_S)
         self.set_pause_ms(pause_ms)
 
         self.noise_floor = 60.0
+        self._active_spec_id: Optional[int] = None
+        self._spec_seq = 0
         self.reset()
 
     def set_voice_level(self, level: Optional[float]):
@@ -126,6 +145,8 @@ class UtteranceSegmenter:
         self._last_voice = 0                     # frames[] length at the last VAD-speech frame
         self._last_loud = 0                      # ... at the last speech frame that was also loud enough
         self._peak = 0.0                         # loudest smoothed RMS inside the current utterance
+        self._active_spec_id = None
+        self._live_next_frame = round(0.5 / FRAME_S)
 
     # ── Input ──
 
@@ -172,6 +193,7 @@ class UtteranceSegmenter:
                 loud_enough = (sum(recent) / len(recent)) >= self.start_rel * self.voice_level
             self._run = self._run + 1 if (p >= self.start_threshold and loud_enough) else 0
             if self._run >= self.start_frames:
+                self._utterance_seq += 1
                 self._in_speech = True
                 self._ema = self._peak = max(f[2] for f in list(self._preroll)[-self.start_frames:])
                 self._frames = list(self._preroll)
@@ -195,17 +217,57 @@ class UtteranceSegmenter:
             if not quiet_vs_speaker:
                 self._last_loud = len(self._frames)
         if p >= self.end_threshold and not quiet_vs_speaker:
+            if self._active_spec_id is not None:
+                # Speaker resumed speech: cancel current in-flight speculative decode
+                if self.on_cancel_speculative:
+                    try:
+                        self.on_cancel_speculative(self._active_spec_id)
+                    except Exception:
+                        pass
+                self._active_spec_id = None
             self._silence = 0
         else:
             self._silence += 1
 
+        # Check for speculative decode opportunity
+        if (self.on_speculative and not self.live_enabled
+                and self._active_spec_id is None
+                and self._silence >= self._spec_frames
+                and self._silence < self._end_silence_frames):
+            spec_utt = self._build_speculative_utterance()
+            if spec_utt is not None:
+                self._spec_seq += 1
+                self._active_spec_id = self._spec_seq
+                spec_utt.spec_id = self._active_spec_id
+                try:
+                    self.on_speculative(spec_utt, self._active_spec_id)
+                except Exception as e:
+                    logger.debug(f"Error dispatching speculative utterance: {e}")
+
         if self._silence >= self._end_silence_frames:
             self._finalize(forced=False)
         elif len(self._frames) >= self._max_frames:
-            self._split_at_quietest()
+            if self.live_enabled and self.commit_partials:
+                self._finalize(forced=True)  # never move already typed words into the next phrase
+            else:
+                self._split_at_quietest()
+        elif (self.live_enabled and self.on_live and not self._silence
+              and len(self._frames) >= self._live_next_frame):
+            self._live_next_frame = len(self._frames) + round(0.5 / FRAME_S)
+            snapshot = self._build_speculative_utterance()
+            if snapshot is not None:
+                self.on_live(snapshot)
 
     def _split_at_quietest(self):
         """Over-long speech: cut at the quietest frame in the last ~4 s instead of mid-word."""
+        if self._active_spec_id is not None:
+            if self.on_cancel_speculative:
+                try:
+                    self.on_cancel_speculative(self._active_spec_id)
+                except Exception:
+                    pass
+            self._active_spec_id = None
+
         window = min(len(self._frames), round(4.0 / FRAME_S))
         base = len(self._frames) - window
         quietest = min(range(base, len(self._frames)), key=lambda i: self._frames[i][2])
@@ -216,6 +278,30 @@ class UtteranceSegmenter:
         self._last_voice = max(0, self._last_voice - len(head))
         self._last_loud = max(0, self._last_loud - len(head))
         self._silence = 0
+        self._utterance_seq += 1
+        self._live_next_frame = len(rest) + round(0.5 / FRAME_S)
+
+    def _build_speculative_utterance(self) -> Optional[Utterance]:
+        end = min(self._last_voice, self._last_loud + self._decay_frames)
+        frames = self._frames[:end + self._tail_keep_frames]
+        voiced = [f for f in frames if f[1] >= self.start_threshold]
+        speech_s = len(voiced) * FRAME_S
+        if speech_s < self.min_speech_s:
+            return None
+        speech_rms = float(np.sqrt(np.mean([f[2] ** 2 for f in voiced])))
+        ratio = (speech_rms / self.voice_level) if (self.voice_gate and self.voice_level) else None
+        return Utterance(
+            pcm=b"".join(f[0] for f in frames),
+            start_s=self._start_frame * FRAME_S,
+            end_s=(self._start_frame + len(frames)) * FRAME_S,
+            speech_s=speech_s,
+            mean_prob=float(np.mean([f[1] for f in voiced])),
+            speech_rms=speech_rms,
+            noise_floor=self.noise_floor,
+            forced=False,
+            level_ratio=ratio,
+            utterance_id=self._utterance_seq,
+        )
 
     def _finalize(self, forced: bool):
         # Keep a short natural tail. It is measured from the last speech frame, so a word's quiet
@@ -225,16 +311,19 @@ class UtteranceSegmenter:
         end = min(self._last_voice, self._last_loud + self._decay_frames)
         frames = self._frames[:end + self._tail_keep_frames]
         start = self._start_frame
+        spec_id = self._active_spec_id
+        self._active_spec_id = None
         self._in_speech = False
         self._frames = []
         self._silence = 0
         self._run = 0
+        self._live_next_frame = round(0.5 / FRAME_S)
         self._preroll.clear()
-        self._emit(frames, start, forced)
+        self._emit(frames, start, forced, spec_id=spec_id)
         if self.on_activity:
             self.on_activity(False)
 
-    def _emit(self, frames: List[_Frame], start_frame: int, forced: bool):
+    def _emit(self, frames: List[_Frame], start_frame: int, forced: bool, spec_id: Optional[int] = None):
         voiced = [f for f in frames if f[1] >= self.start_threshold]
         speech_s = len(voiced) * FRAME_S
         if speech_s < self.min_speech_s:
@@ -263,6 +352,8 @@ class UtteranceSegmenter:
             noise_floor=self.noise_floor,
             forced=forced,
             level_ratio=ratio,
+            spec_id=spec_id,
+            utterance_id=self._utterance_seq,
         )
         try:
             self.on_utterance(utt)

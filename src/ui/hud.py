@@ -160,6 +160,33 @@ body {
   0%,  60%, 100% { filter: contrast(15); }
   20%, 40%       { filter: contrast(3);  }
 }
+
+.preview-badge {
+  position: absolute;
+  bottom: 8px;
+  max-width: 160px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: rgba(14, 14, 18, 0.90);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(8px);
+  color: #ECECF2;
+  font-size: 11px;
+  font-weight: 500;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(5px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+}
+.preview-badge.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
 </style>
 </head>
 <body>
@@ -179,9 +206,11 @@ body {
     </svg>
     <div class="box"></div>
   </div>
+  <div class="preview-badge" id="previewBadge"></div>
 
   <script>
     const el = document.getElementById('loader');
+    const badge = document.getElementById('previewBadge');
 
     // ── Appearance state ──
     let colorTheme      = "rainbow";
@@ -236,6 +265,16 @@ body {
     window.setOpacity = function(val) {
       orbOpacity = Math.max(0.2, Math.min(1.0, val));
       el.style.opacity = orbOpacity.toFixed(2);
+    };
+
+    window.setPreviewText = function(text) {
+      if (!badge) return;
+      if (text && text.trim()) {
+        badge.textContent = text.trim();
+        badge.classList.add('visible');
+      } else {
+        badge.classList.remove('visible');
+      }
     };
 
     window.setAppearanceSettings = function(theme, hue, animStyle, scaleMode, speedMode, baseSize, opacity) {
@@ -632,6 +671,11 @@ class CircularOrbHUD(QWidget):
 
     def set_status(self, text: str):
         pass
+
+    def set_preview_text(self, text: str):
+        """Displays recognized hypothesis live in a sleek floating badge near the orb."""
+        safe_text = (text or "").replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "")
+        self.web_view.page().runJavaScript(f"window.setPreviewText('{safe_text}');")
 
     def _apply_win32_styles(self):
         """Enforces WS_EX_NOACTIVATE so clicking never steals keyboard focus."""

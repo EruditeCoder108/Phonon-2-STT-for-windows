@@ -41,14 +41,13 @@ SOFT_MIN_SPEECH_S = 0.20      # ... and to last long enough to be a word, not a 
 
 MIN_LEVEL_RATIO = 0.30        # speech this far below the learned voice level is background (TV, people nearby)
 LONE_MIN_PROB = 0.85          # ANY lone word needs a confident VAD (hums/breaths score ~0.8, speech ~0.95+)
-LONE_MAX_SPEECH_S = 0.90      # a single real word is never voiced this long ...
 DRAWN_OUT_RATIO = 2.5         # ... nor stretched far beyond the span the model itself gave the word
 
-_WORD_RE = re.compile(r"[a-z0-9']+")
+_WORD_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
 
 def normalized_words(text: str):
-    return _WORD_RE.findall(text.lower())
+    return _WORD_RE.findall(text.casefold())
 
 
 def judge(text: str, utt: Utterance, word_span_s: Optional[float] = None) -> Tuple[bool, str]:
@@ -63,12 +62,12 @@ def judge(text: str, utt: Utterance, word_span_s: Optional[float] = None) -> Tup
 
     phrase = " ".join(words)
     if phrase in HARD_BLOCK or all(w in HARD_BLOCK for w in words):
-        return False, f"filler '{phrase}'"
+        return False, "filler"
 
-    # Degenerate decoder loop ("the the the the ...").
-    if len(words) >= 4 and len(set(words)) == 1:
-        return False, "repetition loop"
-    if len(words) >= 8 and len(set(words)) <= 2:
+    # Repetition alone can be intentional dictation ("no no no no").
+    repetitive = ((len(words) >= 4 and len(set(words)) == 1)
+                  or (len(words) >= 8 and len(set(words)) <= 2))
+    if repetitive and (utt.mean_prob < 0.90 or len(words) / max(utt.speech_s, 0.1) > 8):
         return False, "repetition loop"
 
     if utt.speech_rms < MIN_SPEECH_RMS:
@@ -84,16 +83,14 @@ def judge(text: str, utt: Utterance, word_span_s: Optional[float] = None) -> Tup
     # sigh or a breath that the decoder snapped onto some word ("hmmm" -> "True").
     if len(words) == 1:
         if utt.mean_prob < LONE_MIN_PROB:
-            return False, f"unsure lone '{phrase}' (p={utt.mean_prob:.2f})"
-        if utt.speech_s > LONE_MAX_SPEECH_S:
-            return False, f"drawn-out sound decoded as '{phrase}' ({utt.speech_s:.2f}s voiced)"
+            return False, f"unsure lone word (p={utt.mean_prob:.2f})"
         if word_span_s and utt.speech_s > 0.5 and utt.speech_s > DRAWN_OUT_RATIO * word_span_s:
-            return False, (f"sound much longer than the word '{phrase}' "
+            return False, (f"sound much longer than the decoded word "
                            f"({utt.speech_s:.2f}s voiced vs {word_span_s:.2f}s word)")
 
     if phrase in SOFT_BLOCK:
         if utt.mean_prob < SOFT_MIN_PROB or utt.speech_s < SOFT_MIN_SPEECH_S:
-            return False, (f"unconfident lone '{phrase}' "
+            return False, (f"unconfident lone word "
                            f"(p={utt.mean_prob:.2f}, {utt.speech_s:.2f}s voiced)")
 
     return True, ""

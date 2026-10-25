@@ -1,0 +1,8 @@
+{
+  "name": "rio-motion-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rio procedural voice-reactive orb, interactive HTML studio and deterministic launch-film renderer.",
+  "scripts": {"start": "node serve.cjs", "render": "node render.cjs"},
+  "dependencies": {"motion": "14.6.0"}
+}

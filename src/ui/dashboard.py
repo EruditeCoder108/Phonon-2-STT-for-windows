@@ -16,14 +16,16 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QCheckBox, QStackedWidget, QListWidget,
     QListWidgetItem, QTableWidget, QTableWidgetItem, QHeaderView,
-    QLineEdit, QProgressBar, QFrame, QScrollArea, QApplication, QSlider
+    QLineEdit, QProgressBar, QFrame, QScrollArea, QApplication, QSlider, QPlainTextEdit, QMessageBox
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QSize
 from PySide6.QtGui import QFont, QColor, QIcon, QKeySequence, QKeyEvent
 
 from src.config import get_autostart_registry, set_autostart_registry
-from src.core.audio import AudioCaptureEngine
+from src.core import devices
 from src.core.history import HistoryManager
+from src.config import DEFAULT_PHONON_MODEL, PHONON_MODELS
+from src.core.hotkey import parse_hotkey
 from src.core.vocabulary import VocabularyEngine
 from src.ui.icons import get_svg_icon, get_svg_pixmap
 
@@ -40,6 +42,8 @@ def _make_label(text: str, role: str = "") -> QLabel:
 
 def _make_scrollable(content_widget: QWidget) -> QScrollArea:
     """Wraps a content widget in a smooth, responsive, frameless dark scroll container."""
+    content_widget.setObjectName("scroll_content")
+    content_widget.setStyleSheet("QWidget#scroll_content { background-color: #0C0C0E; }")
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -138,8 +142,20 @@ class HotkeyRecorderButton(QPushButton):
             parts.append("capslock")
         elif Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
             parts.append(f"f{key - Qt.Key.Key_F1 + 1}")
+        elif Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            parts.append(chr(key).lower())
+        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            parts.append(chr(key))
         elif key == Qt.Key.Key_Pause:
             parts.append("pause")
+        elif key in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab, Qt.Key.Key_Escape,
+                     Qt.Key.Key_Backspace, Qt.Key.Key_Delete, Qt.Key.Key_Insert,
+                     Qt.Key.Key_Home, Qt.Key.Key_End, Qt.Key.Key_Left, Qt.Key.Key_Right,
+                     Qt.Key.Key_Up, Qt.Key.Key_Down}:
+            parts.append({Qt.Key.Key_Return: "enter", Qt.Key.Key_Enter: "enter", Qt.Key.Key_Tab: "tab",
+                          Qt.Key.Key_Escape: "escape", Qt.Key.Key_Backspace: "backspace", Qt.Key.Key_Delete: "delete",
+                          Qt.Key.Key_Insert: "insert", Qt.Key.Key_Home: "home", Qt.Key.Key_End: "end",
+                          Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right", Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down"}[key])
         else:
             text = event.text().lower()
             if text:
@@ -147,6 +163,11 @@ class HotkeyRecorderButton(QPushButton):
 
         if parts:
             new_key = "+".join(parts)
+            try:
+                parse_hotkey(new_key)
+            except ValueError:
+                self.setText("Unsupported key. Use a letter, number, F key, or navigation key.")
+                return
             self.current_hotkey = new_key
             self.is_recording = False
             self._update_text()
@@ -157,13 +178,15 @@ class HotkeyRecorderButton(QPushButton):
 
 class DashboardWindow(QMainWindow):
     settings_saved = Signal(dict)
+    devices_refresh_requested = Signal()      # ask the app to re-scan hardware (new USB mic, changed default)
+    engine_retry_requested = Signal()
 
     def __init__(self, config: dict, history_manager: HistoryManager, parent=None):
         super().__init__(parent)
         self.config = config.copy()
         self.history = history_manager
 
-        self.setWindowTitle("Phonon-2 Speech Control Center")
+        self.setWindowTitle("Rio • Speech Control Center")
         self.resize(860, 580)
         self.setMinimumSize(760, 480)
 
@@ -369,7 +392,7 @@ class DashboardWindow(QMainWindow):
             brand_icon.setPixmap(QIcon(icon_path).pixmap(20, 20))
         else:
             brand_icon.setPixmap(get_svg_pixmap("mic", "#0078D4", 20))
-        brand_title = QLabel("Phonon-2")
+        brand_title = QLabel("Rio")
         brand_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #FFFFFF;")
         brand_row.addWidget(brand_icon)
         brand_row.addWidget(brand_title)
@@ -421,6 +444,8 @@ class DashboardWindow(QMainWindow):
 
         # Meter timer for live mic testing
         self.test_audio_engine = None
+        self.capture_engine = None
+        self.mic_testing = False
         self.vu_timer = QTimer(self)
         self.vu_timer.timeout.connect(self._update_live_vu)
 
@@ -439,6 +464,33 @@ class DashboardWindow(QMainWindow):
         layout.addWidget(_make_label("Audio & Speech Input", "title"))
         layout.addWidget(_make_label("Configure microphone capture, audio feedback cues, and speech filtering.", "subtitle"))
 
+        card_engine = QFrame()
+        card_engine.setProperty("class", "card")
+        e_layout = QVBoxLayout(card_engine)
+        e_layout.addWidget(_make_label("Speech Engine", "section"))
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("Phonon • local speech recognition", "phonon")
+        self.engine_combo.addItem("Whistle • compact CPU model (16.9 MB)", "whistle")
+        self.engine_combo.setCurrentIndex(max(0, self.engine_combo.findData(self.config.get("speech_engine", "phonon"))))
+        self.engine_combo.currentIndexChanged.connect(self._save_audio_settings)
+        e_layout.addWidget(self.engine_combo)
+        self.phonon_model_combo = QComboBox()
+        for model, label in PHONON_MODELS.items():
+            self.phonon_model_combo.addItem(label, model)
+        self.phonon_model_combo.setCurrentIndex(max(0, self.phonon_model_combo.findData(
+            self.config.get("phonon_model", DEFAULT_PHONON_MODEL))))
+        self.phonon_model_combo.setEnabled(self.engine_combo.currentData() == "phonon")
+        self.phonon_model_combo.currentIndexChanged.connect(self._save_audio_settings)
+        e_layout.addWidget(self.phonon_model_combo)
+        engine_note = _make_label("Phonon-2.5 English is recommended for English dictation (158 MB first download). The 25-language model detects European languages automatically; Hindi is not supported. Switching ends the current session. Whistle needs an 18.5 MB first download. Download once, then dictate offline.", "subtitle")
+        engine_note.setWordWrap(True)
+        e_layout.addWidget(engine_note)
+        self.retry_engine_btn = QPushButton("Retry loading engine")
+        self.retry_engine_btn.setProperty("class", "secondary")
+        self.retry_engine_btn.clicked.connect(self.engine_retry_requested.emit)
+        e_layout.addWidget(self.retry_engine_btn)
+        layout.addWidget(card_engine)
+
         # Card 1: Input Device & Live Test
         card_dev = QFrame()
         card_dev.setProperty("class", "card")
@@ -447,26 +499,27 @@ class DashboardWindow(QMainWindow):
 
         c_layout.addWidget(_make_label("Input Microphone", "section"))
         self.mic_combo = QComboBox()
-        self.mic_combo.addItem("Default System Microphone", -1)
-
-        devices = AudioCaptureEngine.list_input_devices()
-        curr_idx = self.config.get("mic_index", -1)
-        select_pos = 0
-
-        for pos, dev in enumerate(devices, start=1):
-            self.mic_combo.addItem(f"{dev['name']}", dev["index"])
-            if curr_idx is not None and dev["index"] == curr_idx:
-                select_pos = pos
-
-        self.mic_combo.setCurrentIndex(select_pos)
+        self.populate_mics()
         self.mic_combo.currentIndexChanged.connect(self._save_audio_settings)
-        c_layout.addWidget(self.mic_combo)
+        mic_row = QHBoxLayout()
+        mic_row.setSpacing(8)
+        mic_row.addWidget(self.mic_combo, 1)
+        self.refresh_mics_btn = QPushButton("Refresh")
+        self.refresh_mics_btn.setProperty("class", "secondary")
+        self.refresh_mics_btn.setToolTip("Re-scan for microphones (e.g. after plugging in a USB mic)")
+        self.refresh_mics_btn.clicked.connect(self.devices_refresh_requested.emit)
+        mic_row.addWidget(self.refresh_mics_btn)
+        c_layout.addLayout(mic_row)
+        self.capture_status = _make_label("Checking microphone...", "subtitle")
+        self.capture_status.setWordWrap(True)
+        c_layout.addWidget(self.capture_status)
 
         # Real-time VU meter test
         meter_row = QHBoxLayout()
         meter_row.setSpacing(10)
         self.vu_meter = QProgressBar()
         self.vu_meter.setRange(0, 100)
+        self.vu_meter.setTextVisible(False)
         self.vu_meter.setValue(0)
         self.vu_meter.setFixedHeight(8)
         meter_row.addWidget(self.vu_meter, 1)
@@ -535,6 +588,30 @@ class DashboardWindow(QMainWindow):
 
         f_layout.addWidget(_make_label("Speech Filtering & Cadence", "section"))
 
+        self.delivery_combo = QComboBox()
+        self.delivery_combo.addItem("Complete phrases — recommended", "accurate")
+        self.delivery_combo.addItem("Fast live words — revisions may need review", "fast")
+        self.delivery_combo.setCurrentIndex(1 if self.config.get("dictation_mode") == "fast" else 0)
+        f_layout.addWidget(self.delivery_combo)
+
+        self.live_check = QCheckBox("Recognize partial words while speaking")
+        self.live_check.setChecked(self.config.get("live_typing", True))
+        self.live_check.toggled.connect(self._save_audio_settings)
+        f_layout.addWidget(self.live_check)
+        live_note = _make_label("Complete phrases types final text after a pause. Fast live words can keep an earlier spelling; the complete final stays under tray → Recent transcripts.", "subtitle")
+        live_note.setWordWrap(True)
+        f_layout.addWidget(live_note)
+
+        self.preview_check = QCheckBox("Show a transcript preview below the orb")
+        self.preview_check.setChecked(self.config.get("show_preview", True))
+        self.preview_check.toggled.connect(self._save_audio_settings)
+        f_layout.addWidget(self.preview_check)
+
+        self.quotes_check = QCheckBox("Remove quotation marks wrapping an entire dictated phrase")
+        self.quotes_check.setChecked(self.config.get("strip_outer_quotes", True))
+        self.quotes_check.toggled.connect(self._save_audio_settings)
+        f_layout.addWidget(self.quotes_check)
+
         self.stitch_check = QCheckBox("Smart sentence joining (reconnect mid-sentence pauses)")
         self.stitch_check.setChecked(self.config.get("context_stitch", True))
         self.stitch_check.toggled.connect(self._save_audio_settings)
@@ -569,6 +646,18 @@ class DashboardWindow(QMainWindow):
         pause_row.addWidget(self.pause_combo, 1)
         f_layout.addLayout(pause_row)
 
+        terms_note = _make_label("Recognition terms (Phonon only): up to 25 names or technical terms, one per line. Bias can also introduce mistakes; start with a short list.", "subtitle")
+        terms_note.setWordWrap(True)
+        f_layout.addWidget(terms_note)
+        self.terms_edit = QPlainTextEdit()
+        self.terms_edit.setPlaceholderText("Phonon\nmacOS")
+        self.terms_edit.setPlainText("\n".join(self.config.get("recognition_terms", [])))
+        self.terms_edit.setMaximumHeight(85)
+        f_layout.addWidget(self.terms_edit)
+        terms_save = QPushButton("Apply recognition terms")
+        terms_save.clicked.connect(self._save_audio_settings)
+        f_layout.addWidget(terms_save)
+
         layout.addWidget(card_filt)
 
         # Card 4: General Preferences
@@ -577,7 +666,7 @@ class DashboardWindow(QMainWindow):
         g_layout = QVBoxLayout(card_gen)
         g_layout.setSpacing(8)
 
-        self.startup_check = QCheckBox("Start Phonon-2 automatically on Windows startup (minimized)")
+        self.startup_check = QCheckBox("Start Rio automatically on Windows startup (minimized)")
         self.startup_check.setChecked(get_autostart_registry())
         self.startup_check.toggled.connect(self._on_startup_toggled)
         g_layout.addWidget(self.startup_check)
@@ -588,6 +677,8 @@ class DashboardWindow(QMainWindow):
         g_layout.addWidget(self.history_check)
 
         layout.addWidget(card_gen)
+        self.delivery_combo.currentIndexChanged.connect(self._save_audio_settings)
+        self.terms_edit.setEnabled(self.engine_combo.currentData() == "phonon")
         layout.addStretch()
 
         return _make_scrollable(container)
@@ -597,38 +688,69 @@ class DashboardWindow(QMainWindow):
         self.config["autostart"] = enabled
         self.settings_saved.emit(self.config)
 
+    def populate_mics(self):
+        """(Re)fills the microphone list: real microphones only, one entry each, by full name."""
+        saved = self.config.get("mic_name")
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        self.mic_combo.addItem("Default System Microphone", None)
+        try:
+            names = devices.list_microphones()
+        except Exception:
+            names = []
+        for name in names:
+            self.mic_combo.addItem(name, name)
+        if saved and saved not in names:                 # keep the choice visible while the mic is unplugged
+            self.mic_combo.addItem(f"{saved} (not connected)", saved)
+            self.mic_combo.model().item(self.mic_combo.count() - 1).setEnabled(False)
+        self.mic_combo.setCurrentIndex(max(0, self.mic_combo.findData(saved)))
+        self.mic_combo.blockSignals(False)
+
     def _toggle_mic_test(self):
-        if self.test_audio_engine is None:
-            mic_data = self.mic_combo.currentData()
-            mic_idx = None if mic_data == -1 else mic_data
+        if not self.mic_testing:
+            if self.capture_engine is None or self.capture_engine.needs_recovery:
+                self.capture_status.setText("Microphone unavailable or reconnecting. Connect it and press Refresh.")
+                return
             self.current_live_level = 0.0
-
-            def _on_lvl(lvl):
-                self.current_live_level = lvl
-
-            self.test_audio_engine = AudioCaptureEngine(device_index=mic_idx, on_level_update=_on_lvl)
-            self.test_audio_engine.start()
+            self.mic_testing = True
             self.vu_timer.start(30)
             self.test_mic_btn.setIcon(get_svg_icon("square", "#FFFFFF", 14))
             self.test_mic_btn.setText("Stop Test")
             self.test_mic_btn.setStyleSheet("background-color: #A32020; color: #FFFFFF; border-color: #C42B1C;")
         else:
             self.vu_timer.stop()
-            self.test_audio_engine.stop()
-            self.test_audio_engine.close_stream()
-            self.test_audio_engine = None
+            self.mic_testing = False
             self.vu_meter.setValue(0)
             self.test_mic_btn.setIcon(get_svg_icon("mic", "#FFFFFF", 14))
             self.test_mic_btn.setText("Test Mic")
             self.test_mic_btn.setStyleSheet("")
+
+    def update_capture_status(self):
+        capture = self.capture_engine
+        if capture is None or capture.needs_recovery:
+            self.capture_status.setText("No working microphone. Connect one; recovery retries automatically.")
+        elif capture.fallback_reason:
+            self.capture_status.setText(capture.fallback_reason)
+        else:
+            self.capture_status.setText(f"Listening device: {capture.active_device}")
 
     def _update_live_vu(self):
         val = int(getattr(self, "current_live_level", 0.0) * 100)
         self.vu_meter.setValue(min(100, val))
 
     def _save_audio_settings(self):
-        mic_data = self.mic_combo.currentData()
-        self.config["mic_index"] = None if mic_data == -1 else mic_data
+        terms = [line.strip() for line in self.terms_edit.toPlainText().splitlines() if line.strip()]
+        if len(terms) > 25 or any(len(term) > 80 for term in terms):
+            QMessageBox.warning(self, "Recognition terms", "Use up to 25 terms, with at most 80 characters per term.")
+            return
+        from src.config import recognition_terms
+        self.config["recognition_terms"] = recognition_terms(terms)
+        self.config["dictation_mode"] = self.delivery_combo.currentData()
+        self.terms_edit.setEnabled(self.engine_combo.currentData() == "phonon")
+        self.config["speech_engine"] = self.engine_combo.currentData()
+        self.config["phonon_model"] = self.phonon_model_combo.currentData()
+        self.phonon_model_combo.setEnabled(self.engine_combo.currentData() == "phonon")
+        self.config["mic_name"] = self.mic_combo.currentData()
         self.config["sound_effects"] = self.chime_check.isChecked()
         self.config["sound_theme"] = self.sound_theme_combo.currentData()
         self.config["sound_volume"] = self.sound_volume_slider.value()
@@ -637,6 +759,9 @@ class DashboardWindow(QMainWindow):
         self.config["voice_gate"] = self.gate_check.isChecked()
         self.config["remove_fillers"] = self.filler_check.isChecked()
         self.config["pause_ms"] = self.pause_combo.currentData()
+        self.config["live_typing"] = self.live_check.isChecked()
+        self.config["show_preview"] = self.preview_check.isChecked()
+        self.config["strip_outer_quotes"] = self.quotes_check.isChecked()
         self.settings_saved.emit(self.config)
 
     # ── Tab 2: Hotkeys & Trigger Mode ──
@@ -703,6 +828,10 @@ class DashboardWindow(QMainWindow):
             self.ptt_mode_btn.setStyleSheet("")
 
     def _on_hotkey_changed(self, new_key: str):
+        try:
+            parse_hotkey(new_key)
+        except ValueError:
+            return
         self.config["trigger_key"] = new_key
         self.recorder_btn.current_hotkey = new_key
         self.recorder_btn._update_text()
@@ -866,6 +995,7 @@ class DashboardWindow(QMainWindow):
             c_layout.addLayout(meta_layout)
 
             text_label = QLabel(text)
+            text_label.setTextFormat(Qt.TextFormat.PlainText)
             text_label.setWordWrap(True)
             text_label.setStyleSheet("color: #FFFFFF; font-size: 13px; line-height: 1.4;")
             c_layout.addWidget(text_label)
@@ -906,11 +1036,11 @@ class DashboardWindow(QMainWindow):
         i_layout.setSpacing(10)
 
         items = [
-            ("Speech Model Architecture", "Phonon-2 (Ternary Quantized Parakeet-TDT 0.6B)"),
-            ("Model Weight Footprint", "164 MB (12 pinned quantized shards)"),
-            ("Word Error Rate (WER)", "5.21% (Zero cloud telemetry)"),
-            ("Hardware Acceleration", "Intel/AMD AVX-512 / AVX2 Vector Acceleration"),
-            ("Execution Mode", "100% Offline Local Inference"),
+            ("Available Speech Engines", "Phonon-2.5 English / 25 languages; Whistle"),
+            ("Phonon-2.5 Download", "English: 158 MB • 25 languages: 156 MB"),
+            ("Model Storage", "About 178 MB unpacked per Phonon-2.5 model"),
+            ("Hardware Acceleration", "CPU • runtime selects supported kernels"),
+            ("Execution Mode", "Local inference • internet for first download"),
             ("Local HTTP Daemon", f"http://127.0.0.1:{self.config.get('port', 8010)}"),
             ("Local WebSocket Stream", f"ws://127.0.0.1:{self.config.get('port', 8010)}/v1/audio/stream"),
         ]

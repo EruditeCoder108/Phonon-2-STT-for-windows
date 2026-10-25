@@ -1,0 +1,6 @@
+node_modules/
+.render/
+*-video-only.mp4
+audio-original.wav
+rio-final-audio.wav
+voice-demo.wav
