@@ -19,6 +19,18 @@ The frozen audit inputs are in `.model-research/dictation-audit-2026-10-24/`. Fi
 
 `tests-final.log` records the regression suite. `retest.json` records real-time-paced playback through the actual VAD, worker and pipeline with an output collector, using the same three personal recordings and reference text. Phonon 2.5 English additionally exercises the public/noise/long-speech corpus and a repeated quiet recording. Fast mode is measured separately. Each completed accurate-mode case asserts zero word difference between accepted final text and delivered output.
 
+The final regression suite passed **204 tests**. All **20 primary accurate-mode replays** passed their accepted-final completeness check. Weighted reference word error on the three personal recordings changed as follows:
+
+| Model | Previous live delivery | Complete phrases |
+|---|---:|---:|
+| Phonon 2 | 51.86% | 17.39% |
+| Phonon 2.5 English | 46.89% | 13.98% |
+| Phonon 2.5 multilingual | 32.92% | 11.80% |
+
+These are the same supplied references with case/punctuation ignored, including remaining model errors. On English, the quiet/fan/YouTube recordings changed from 51.5%/56.3%/31.0% to 5.8%/9.2%/28.0%. The 34-second noisy recording finished delivery at 36.42 seconds instead of 66.53 seconds in the observed runs; latency load was not controlled for statistical claims.
+
+A manually initiated Windows QA check also passed complete final insertion, Hindi/emoji order and same-window field-focus protection. That check first exposed emoji reordering; isolating supplementary characters into intact UTF-16 packets with short processing boundaries fixed the reproduced case. No persistent clipboard fallback is required for this typing path. The result is specific to the tested field, and does not establish compatibility with every application.
+
 Reproduce a small public check with:
 
 ```powershell

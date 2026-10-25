@@ -11,6 +11,7 @@ from src.core.filters import judge
 from src.core.pipeline import continuation_index
 from src.core.recovery import TranscriptRecovery
 from src.core.vocabulary import VocabularyEngine
+from src.core import injector as INJ
 from test_core import FakeEngine, make_pipeline, make_utt
 
 
@@ -114,6 +115,16 @@ class DeliveryQualityTests(unittest.TestCase):
         self.assertEqual([e.text for e in store.entries()], ['<b>new</b>', 'middle'])
         store.clear()
         self.assertEqual(store.entries(), [])
+
+    def test_supplementary_character_has_its_own_intact_input_packet(self):
+        packets = list(INJ._unicode_batches('before 🌱 after'))
+        self.assertEqual([flag for _,flag in packets], [False, True, False])
+        self.assertEqual([event for batch,_ in packets for event in batch], INJ._text_to_key_events('before 🌱 after'))
+        self.assertEqual(len(packets[1][0]), 4)
+        with patch.object(INJ.user32, 'SendInput', side_effect=lambda count,*args:count) as send, patch.object(INJ.time, 'sleep') as pause:
+            self.assertTrue(INJ.type_unicode_chars('before 🌱 after'))
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(pause.call_count, 2)
 
     def test_repeated_anchor_does_not_guess_a_continuation(self):
         self.assertIsNone(continuation_index('meet Jon today'.split(), 'meet John today and Jon today again'.split()))

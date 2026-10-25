@@ -259,12 +259,15 @@ def type_unicode_chars(text: str, expected_hwnd: int | None = None) -> bool:
     if not text:
         return True
 
-    events = _text_to_key_events(text)
-    step = _SENDINPUT_BATCH_CHARS * 2
-    for i in range(0, len(events), step):
+    for batch, supplementary in _unicode_batches(text):
+        # Some editors handle surrogate-pair characters via a different event
+        # path. In one large packet that path can overtake earlier BMP text.
+        # Give surrounding input a message-pump boundary, and keep both UTF-16
+        # halves together. Ordinary text retains the fast batched path.
+        if supplementary:
+            time.sleep(.05)
         if expected_hwnd is not None and get_foreground_hwnd() != expected_hwnd:
             return False
-        batch = events[i:i + step]
         arr = (INPUT * len(batch))()
         for j, (vk, scan, flags) in enumerate(batch):
             arr[j].type = INPUT_KEYBOARD
@@ -273,7 +276,26 @@ def type_unicode_chars(text: str, expected_hwnd: int | None = None) -> bool:
         if sent != len(batch):
             logger.warning(f"SendInput accepted {sent}/{len(batch)} events (blocked by the target window?).")
             return False
+        if supplementary:
+            time.sleep(.05)
     return True
+
+
+def _unicode_batches(text):
+    pending = []
+    for ch in text:
+        if ord(ch) > 0xFFFF:
+            if pending:
+                yield _text_to_key_events("".join(pending)), False
+                pending = []
+            yield _text_to_key_events(ch), True
+        else:
+            pending.append(ch)
+            if len(pending) >= _SENDINPUT_BATCH_CHARS:
+                yield _text_to_key_events("".join(pending)), False
+                pending = []
+    if pending:
+        yield _text_to_key_events("".join(pending)), False
 
 
 def get_foreground_window_title() -> str:
